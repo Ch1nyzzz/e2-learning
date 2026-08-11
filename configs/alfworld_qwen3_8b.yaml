@@ -17,9 +17,9 @@ generation:
 
 judge:
   provider: openai_compatible
-  model: "${JUDGE_MODEL:-}"
+  model: "${JUDGE_MODEL:-Vendor3/DeepSeek-V4-Flash}"
   api_key_env: JUDGE_API_KEY
-  base_url: "${JUDGE_BASE_URL:-}"
+  base_url: "${JUDGE_BASE_URL:-https://api.gpugeek.com/v1}"
   timeout_seconds: 60
   max_retries: 3
   cache_path: outputs/alfworld_qwen3_8b/judge_cache.sqlite3
