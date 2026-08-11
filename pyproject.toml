@@ -1,0 +1,41 @@
+[build-system]
+requires = ["hatchling>=1.27"]
+build-backend = "hatchling.build"
+
+[project]
+name = "experience-learning"
+version = "0.1.0"
+description = "Mistake-driven, environment-centric world-model learning in ALFWorld"
+readme = "README.md"
+requires-python = ">=3.10,<3.12"
+dependencies = [
+  "numpy>=1.26,<3",
+  "openai>=1.70,<3",
+  "PyYAML>=6.0.2,<7",
+]
+
+[project.optional-dependencies]
+train = [
+  "accelerate==1.14.0",
+  "torch==2.13.0",
+  "transformers==5.14.1",
+]
+alfworld = ["alfworld==0.4.2", "textworld[pddl]==1.7.0"]
+dev = ["pytest>=8.3,<10", "pytest-cov>=6,<8", "ruff>=0.11,<1"]
+
+[project.scripts]
+experience-learning = "experience_learning.cli:main"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/experience_learning"]
+
+[tool.pytest.ini_options]
+addopts = "-q"
+testpaths = ["tests"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py310"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B"]

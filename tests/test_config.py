@@ -1,0 +1,31 @@
+from pathlib import Path
+
+import pytest
+
+from experience_learning.config import AppConfig, load_config
+
+
+def test_config_expands_environment_and_applies_override(tmp_path: Path, monkeypatch) -> None:
+    monkeypatch.setenv("JUDGE_MODEL", "judge-test")
+    config_file = tmp_path / "config.yaml"
+    config_file.write_text(
+        "judge:\n  model: '${JUDGE_MODEL:-fallback}'\nexperiment:\n  max_environment_steps: 5\n",
+        encoding="utf-8",
+    )
+    config = load_config(config_file, ["experiment.max_environment_steps=7"])
+    assert config.judge.model == "judge-test"
+    assert config.experiment.max_environment_steps == 7
+
+
+def test_openai_compatible_judge_requires_explicit_model() -> None:
+    config = AppConfig()
+    config.judge.model = ""
+    with pytest.raises(ValueError, match="JUDGE_MODEL"):
+        config.validate()
+
+
+def test_exact_match_smoke_judge_does_not_require_api_model() -> None:
+    config = AppConfig()
+    config.judge.provider = "exact_match"
+    config.judge.model = ""
+    config.validate()
