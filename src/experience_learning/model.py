@@ -396,7 +396,10 @@ class TransformersWorldModel:
                     raise RuntimeError(
                         "structured prompt packing exceeded the generation token budget"
                     )
-                with torch.inference_mode():
+                # FSDP2 may materialize full parameters during generation. inference_mode would
+                # mark those tensors as inference-only and make a later training backward fail;
+                # no_grad avoids graph construction without changing tensor provenance.
+                with torch.no_grad():
                     generation_output = unwrapped.generate(**encoded, **generation_kwargs)
                 prompt_length = encoded["input_ids"].shape[1]
                 generated = (
