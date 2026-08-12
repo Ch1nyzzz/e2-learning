@@ -110,6 +110,13 @@ Periodic checkpoint retention defaults to the newest three checkpoints via
 `training.max_periodic_checkpoints_to_keep`; the final checkpoint is retained separately. Set the
 value to `0` only when unlimited periodic checkpoint history is intentional.
 
+Online collection can run synchronized environment waves with
+`experiment.parallel_environments`. Candidate predictions from every active environment are
+flattened into one distributed generation batch, semantic checks use up to
+`judge.max_concurrency` workers, and gated examples accumulate until
+`training.update_batch_size` before a teacher-forced SFT update. Each environment receives a
+disjoint partition of the ALFWorld game list.
+
 ## Held-out transition evaluation
 
 Create fixed probe sets before training so every method/seed is evaluated on identical
@@ -127,16 +134,16 @@ uv run --extra alfworld experience-learning collect-probes \
   --output data/probes_valid_unseen.jsonl
 ```
 
-Evaluate a sharded checkpoint with the same four-GPU launch configuration:
+Evaluate a sharded checkpoint with the same two-GPU launch configuration:
 
 ```bash
 uv run --extra train --extra alfworld accelerate launch \
-  --config_file configs/accelerate/fsdp_4xa100_80gb.yaml \
+  --config_file configs/accelerate/fsdp_2xa100_80gb.yaml \
   -m experience_learning.cli evaluate-probes \
   --config configs/alfworld_qwen3_8b.yaml \
-  --checkpoint outputs/alfworld_qwen3_8b/checkpoints/final \
+  --checkpoint outputs/alfworld_qwen3_8b_parallel8/checkpoints/final \
   --probes data/probes_valid_unseen.jsonl \
-  --output outputs/alfworld_qwen3_8b/eval_valid_unseen.jsonl
+  --output outputs/alfworld_qwen3_8b_parallel8/eval_valid_unseen.jsonl
 ```
 
 The summary reports conservative semantic accuracy (uncertain counts as incorrect), a semantic

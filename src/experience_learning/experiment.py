@@ -5,6 +5,8 @@ import json
 import random
 import shutil
 from collections import deque
+from collections.abc import Sequence
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import asdict
 from pathlib import Path
 from typing import Any
@@ -33,15 +35,23 @@ class OnlineExperienceExperiment:
         config: AppConfig,
         model: WorldModel,
         is_main_process: bool,
-        environment: Environment | None,
+        environment: Environment | Sequence[Environment] | None,
         judge: SemanticJudge | None,
     ):
-        if is_main_process and (environment is None or judge is None):
+        if environment is None:
+            environments: list[Environment] = []
+        elif isinstance(environment, Sequence):
+            environments = list(environment)
+        else:
+            environments = [environment]
+        if is_main_process and (not environments or judge is None):
             raise ValueError("rank 0 requires both environment and judge")
+        if is_main_process and len(environments) != config.experiment.parallel_environments:
+            raise ValueError("rank 0 environment count must match experiment.parallel_environments")
         self.config = config
         self.model = model
         self.is_main_process = is_main_process
-        self.environment = environment
+        self.environments = environments
         self.judge = judge
         self.rng = random.Random(config.experiment.seed)
         self.output_dir = Path(config.experiment.output_dir)
@@ -63,9 +73,7 @@ class OnlineExperienceExperiment:
                 "event logger startup failed: "
                 f"{logger_startup['error_type']}: {logger_startup['error']}"
             )
-        self.recent_errors: deque[int] = deque(
-            maxlen=config.experiment.stop_error_rate_window
-        )
+        self.recent_errors: deque[int] = deque(maxlen=config.experiment.stop_error_rate_window)
         self.optimizer_step = 0
         self.last_checkpoint_environment_step = 0
 
@@ -87,116 +95,144 @@ class OnlineExperienceExperiment:
             )
         return packet["payload"]
 
-    def _log_event(self, event_type: str, **payload: Any) -> None:
+    def _log_events(self, records: Sequence[tuple[str, dict[str, Any]]]) -> None:
         def operation() -> dict[str, Any]:
             assert self.logger is not None
-            self.logger.write(event_type, **payload)
+            for event_type, payload in records:
+                self.logger.write(event_type, **payload)
             return {}
 
         self._controller_packet(operation)
 
-    def _reset(self) -> EnvironmentState:
-        payload = self._controller_packet(
-            lambda: self.environment.reset().to_dict()  # type: ignore[union-attr]
-        )
-        return EnvironmentState.from_dict(payload)
+    def _reset_many(self, environment_indices: Sequence[int]) -> list[EnvironmentState]:
+        def operation() -> list[dict[str, Any]]:
+            return [self.environments[index].reset().to_dict() for index in environment_indices]
 
-    def _select_action(
+        payload = self._controller_packet(operation)
+        return [EnvironmentState.from_dict(item) for item in payload]
+
+    def _select_actions(
         self,
-        *,
-        context: EpisodeContext,
-        actions: tuple[str, ...],
-        predictions: list[list[str]],
-        token_predictions: list[TokenEntropyPrediction] | None = None,
-    ) -> dict[str, Any]:
-        def operation() -> dict[str, Any]:
+        items: Sequence[
+            tuple[
+                EpisodeContext,
+                tuple[str, ...],
+                list[list[str]],
+                list[TokenEntropyPrediction] | None,
+            ]
+        ],
+    ) -> list[dict[str, Any]]:
+        def operation() -> list[dict[str, Any]]:
             assert self.judge is not None
-            predictions_by_action = dict(zip(actions, predictions, strict=True))
-            if self.config.acquisition.strategy == "token_entropy":
-                if token_predictions is None or len(token_predictions) != len(actions):
-                    raise ValueError("token entropy acquisition requires one score per action")
-                decision = select_by_token_entropy(
-                    dict(zip(actions, token_predictions, strict=True)),
-                    rng=self.rng,
-                )
-                return {
-                    "action": decision.action,
-                    "score": decision.score,
-                    "predictions": [asdict(item) for item in decision.predictions],
-                }
-            if self.config.acquisition.strategy == "random":
-                action = self.rng.choice(list(actions))
-                return {
-                    "action": action,
-                    "score": None,
-                    "predictions": [
+            decisions: list[dict[str, Any]] = []
+            for context, actions, predictions, token_predictions in items:
+                predictions_by_action = dict(zip(actions, predictions, strict=True))
+                if self.config.acquisition.strategy == "token_entropy":
+                    if token_predictions is None or len(token_predictions) != len(actions):
+                        raise ValueError("token entropy acquisition requires one score per action")
+                    decision = select_by_token_entropy(
+                        dict(zip(actions, token_predictions, strict=True)),
+                        rng=self.rng,
+                    )
+                    decisions.append(
                         {
-                            "action": candidate,
-                            "samples": samples,
-                            "clusters": [],
-                            "entropy": None,
+                            "action": decision.action,
+                            "score": decision.score,
+                            "predictions": [asdict(item) for item in decision.predictions],
                         }
-                        for candidate, samples in predictions_by_action.items()
-                    ],
-                }
-            decision = select_by_semantic_entropy(
-                predictions_by_action,
-                lambda action, left, right: self.judge.compare(
-                    context=context,
-                    action=action,
-                    left=left,
-                    right=right,
-                ),
-                rng=self.rng,
-                uncertain_is_distinct=(
-                    self.config.acquisition.uncertain_comparisons_are_distinct
-                ),
-                normalize=self.config.acquisition.normalize_entropy,
-            )
-            return {
-                "action": decision.action,
-                "score": decision.score,
-                "predictions": [asdict(item) for item in decision.predictions],
-            }
+                    )
+                    continue
+                if self.config.acquisition.strategy == "random":
+                    action = self.rng.choice(list(actions))
+                    decisions.append(
+                        {
+                            "action": action,
+                            "score": None,
+                            "predictions": [
+                                {
+                                    "action": candidate,
+                                    "samples": samples,
+                                    "clusters": [],
+                                    "entropy": None,
+                                }
+                                for candidate, samples in predictions_by_action.items()
+                            ],
+                        }
+                    )
+                    continue
+                decision = select_by_semantic_entropy(
+                    predictions_by_action,
+                    lambda action, left, right, context=context: self.judge.compare(
+                        context=context,
+                        action=action,
+                        left=left,
+                        right=right,
+                    ),
+                    rng=self.rng,
+                    uncertain_is_distinct=(
+                        self.config.acquisition.uncertain_comparisons_are_distinct
+                    ),
+                    normalize=self.config.acquisition.normalize_entropy,
+                )
+                decisions.append(
+                    {
+                        "action": decision.action,
+                        "score": decision.score,
+                        "predictions": [asdict(item) for item in decision.predictions],
+                    }
+                )
+            return decisions
 
         return self._controller_packet(operation)
 
-    def _step_and_judge(
+    def _step_and_judge_many(
         self,
-        *,
-        context: EpisodeContext,
-        action: str,
-        point_prediction: str,
-        episode: int,
-        global_step: int,
-        acquisition: dict[str, Any],
-    ) -> dict[str, Any]:
-        def operation() -> dict[str, Any]:
+        jobs: Sequence[tuple[int, EpisodeContext, str, str, int, int, dict[str, Any]]],
+    ) -> list[dict[str, Any]]:
+        def operation() -> list[dict[str, Any]]:
             assert self.judge is not None
-            assert self.environment is not None
-            next_state = self.environment.step(action)
-            verdict = self.judge.compare(
-                context=context,
-                action=action,
-                left=point_prediction,
-                right=next_state.observation,
-            )
-            experience = Experience(
-                context=EpisodeContext.from_dict(context.to_dict()),
-                action=action,
-                predicted_observation=point_prediction,
-                actual_observation=next_state.observation,
-                step=global_step,
-                episode=episode,
-            )
-            return {
-                "next_state": next_state.to_dict(),
-                "experience": experience.to_dict(),
-                "verdict": verdict.verdict.value,
-                "judge_confidence": verdict.confidence,
-                "judge_rationale": verdict.rationale,
-                "acquisition": acquisition,
-            }
+
+            def execute(
+                job: tuple[int, EpisodeContext, str, str, int, int, dict[str, Any]],
+            ) -> dict[str, Any]:
+                (
+                    environment_index,
+                    context,
+                    action,
+                    point_prediction,
+                    episode,
+                    step,
+                    acquisition,
+                ) = job
+                next_state = self.environments[environment_index].step(action)
+                verdict = self.judge.compare(
+                    context=context,
+                    action=action,
+                    left=point_prediction,
+                    right=next_state.observation,
+                )
+                experience = Experience(
+                    context=EpisodeContext.from_dict(context.to_dict()),
+                    action=action,
+                    predicted_observation=point_prediction,
+                    actual_observation=next_state.observation,
+                    step=step,
+                    episode=episode,
+                )
+                return {
+                    "next_state": next_state.to_dict(),
+                    "experience": experience.to_dict(),
+                    "verdict": verdict.verdict.value,
+                    "judge_confidence": verdict.confidence,
+                    "judge_rationale": verdict.rationale,
+                    "acquisition": acquisition,
+                }
+
+            workers = min(self.config.judge.max_concurrency, len(jobs))
+            if workers <= 1:
+                return [execute(job) for job in jobs]
+            with ThreadPoolExecutor(max_workers=workers) as executor:
+                return list(executor.map(execute, jobs))
 
         return self._controller_packet(operation)
 
@@ -218,6 +254,7 @@ class OnlineExperienceExperiment:
     ) -> None:
         path = self.output_dir / "checkpoints" / name
         self.model.save(str(path))
+
         def operation() -> dict[str, Any]:
             assert self.logger is not None
             controller_state = {
@@ -302,151 +339,268 @@ class OnlineExperienceExperiment:
         mistakes = int(resume["mistakes"])
         uncertain = int(resume["uncertain"])
         checkpoint_due = False
+        pending_updates: list[Experience] = []
+
+        def apply_pending_updates(*, force: bool) -> dict[str, float]:
+            metrics: dict[str, float] = {}
+            batch_size = self.config.training.update_batch_size
+            while len(pending_updates) >= batch_size or (force and pending_updates):
+                take = min(batch_size, len(pending_updates))
+                batch = pending_updates[:take]
+                del pending_updates[:take]
+                for _ in range(self.config.training.updates_per_mistake):
+                    metrics = self.model.learn(batch)
+                self.optimizer_step = int(metrics["optimizer_step"])
+            return metrics
+
         try:
-            # Recreate ALFWorld's deterministic game iterator. Checkpoints are controller-complete
-            # only at episode boundaries, so no mid-episode environment state needs to be pickled.
-            for _ in range(completed_episodes):
-                self._reset()
-            for episode in range(completed_episodes, self.config.experiment.max_episodes):
-                if global_step >= self.config.experiment.max_environment_steps:
-                    break
-                state = self._reset()
-                context = EpisodeContext(initial_observation=state.observation)
-                self._log_event(
-                    "episode_start",
-                    episode=episode,
-                    global_step=global_step,
-                    gamefile=state.metadata.get("gamefile", ""),
-                    initial_observation=state.observation,
+            # Each environment owns a disjoint game partition. Replaying the resets assigned to
+            # each slot reconstructs its deterministic iterator at an episode-boundary checkpoint.
+            for episode in range(completed_episodes):
+                self._reset_many([episode % self.config.experiment.parallel_environments])
+
+            stop_requested = False
+            while (
+                completed_episodes < self.config.experiment.max_episodes
+                and global_step < self.config.experiment.max_environment_steps
+                and not stop_requested
+            ):
+                wave_end = min(
+                    completed_episodes + self.config.experiment.parallel_environments,
+                    self.config.experiment.max_episodes,
                 )
-                while not state.done:
-                    if global_step >= self.config.experiment.max_environment_steps:
+                episode_ids = list(range(completed_episodes, wave_end))
+                environment_indices = [
+                    episode % self.config.experiment.parallel_environments
+                    for episode in episode_ids
+                ]
+                states = self._reset_many(environment_indices)
+                contexts = [
+                    EpisodeContext(initial_observation=state.observation) for state in states
+                ]
+                self._log_events(
+                    [
+                        (
+                            "episode_start",
+                            {
+                                "episode": episode,
+                                "environment_slot": environment_index,
+                                "global_step": global_step,
+                                "gamefile": state.metadata.get("gamefile", ""),
+                                "initial_observation": state.observation,
+                            },
+                        )
+                        for episode, environment_index, state in zip(
+                            episode_ids, environment_indices, states, strict=True
+                        )
+                    ]
+                )
+                active = [index for index, state in enumerate(states) if not state.done]
+
+                while active and global_step < self.config.experiment.max_environment_steps:
+                    actions_by_slot: dict[int, tuple[str, ...]] = {}
+                    for slot in active:
+                        actions = filter_actions(
+                            states[slot].admissible_actions,
+                            excluded=self.config.environment.excluded_actions,
+                            maximum=self.config.environment.max_candidate_actions,
+                        )
+                        if actions:
+                            actions_by_slot[slot] = actions
+                    active = [slot for slot in active if slot in actions_by_slot]
+                    if not active:
                         break
-                    actions = filter_actions(
-                        state.admissible_actions,
-                        excluded=self.config.environment.excluded_actions,
-                        maximum=self.config.environment.max_candidate_actions,
-                    )
-                    if not actions:
-                        break
+                    remaining = self.config.experiment.max_environment_steps - global_step
+                    round_slots = active[:remaining]
                     generation_seed = self.config.experiment.seed + global_step * 1009
-                    token_predictions: list[TokenEntropyPrediction] | None = None
+                    requests: list[tuple[EpisodeContext, str]] = []
+                    spans: list[tuple[int, int]] = []
+                    for slot in round_slots:
+                        start = len(requests)
+                        requests.extend(
+                            (contexts[slot], action) for action in actions_by_slot[slot]
+                        )
+                        spans.append((start, len(requests)))
+
+                    flat_token_predictions: list[TokenEntropyPrediction] | None = None
                     if self.config.acquisition.strategy == "token_entropy":
-                        token_predictions = self.model.predict_with_token_entropy(
-                            [(context, action) for action in actions],
+                        flat_token_predictions = self.model.predict_with_token_entropy(
+                            requests,
                             seed=generation_seed,
                         )
-                        predictions = [[item.observation] for item in token_predictions]
+                        flat_predictions = [
+                            [prediction.observation] for prediction in flat_token_predictions
+                        ]
                     else:
-                        predictions = self.model.predict(
-                            [(context, action) for action in actions],
+                        flat_predictions = self.model.predict(
+                            requests,
                             samples_per_request=self.config.generation.samples_per_action,
                             do_sample=True,
                             seed=generation_seed,
                         )
-                    acquisition = self._select_action(
-                        context=context,
-                        actions=actions,
-                        predictions=predictions,
-                        token_predictions=token_predictions,
-                    )
-                    if self.config.acquisition.strategy == "token_entropy":
-                        chosen_index = actions.index(str(acquisition["action"]))
-                        point_generation_seed = generation_seed
-                        point_prediction = predictions[chosen_index][0]
-                        point_prediction_reused = True
+
+                    selection_items = []
+                    for slot, (start, end) in zip(round_slots, spans, strict=True):
+                        token_slice = (
+                            None
+                            if flat_token_predictions is None
+                            else flat_token_predictions[start:end]
+                        )
+                        selection_items.append(
+                            (
+                                contexts[slot],
+                                actions_by_slot[slot],
+                                flat_predictions[start:end],
+                                token_slice,
+                            )
+                        )
+                    acquisitions = self._select_actions(selection_items)
+
+                    point_generation_seed = generation_seed
+                    point_prediction_reused = self.config.acquisition.strategy == "token_entropy"
+                    if point_prediction_reused:
+                        point_predictions = []
+                        for slot, (start, _), acquisition in zip(
+                            round_slots, spans, acquisitions, strict=True
+                        ):
+                            chosen_index = actions_by_slot[slot].index(str(acquisition["action"]))
+                            point_predictions.append(flat_predictions[start + chosen_index][0])
                     else:
                         point_generation_seed = generation_seed + 1
-                        point_prediction = self.model.predict(
-                            [(context, str(acquisition["action"]))],
-                            samples_per_request=1,
-                            do_sample=False,
-                            seed=point_generation_seed,
-                        )[0][0]
-                        point_prediction_reused = False
-                    packet = self._step_and_judge(
-                        context=context,
-                        action=str(acquisition["action"]),
-                        point_prediction=point_prediction,
-                        episode=episode,
-                        global_step=global_step,
-                        acquisition=acquisition,
-                    )
-                    experience = Experience.from_dict(packet["experience"])
-                    verdict = Verdict(packet["verdict"])
-                    if verdict is Verdict.DIFFERENT:
-                        mistakes += 1
-                        self.recent_errors.append(1)
-                    elif verdict is Verdict.EQUIVALENT:
-                        self.recent_errors.append(0)
-                    else:
-                        uncertain += 1
+                        point_predictions = [
+                            outcomes[0]
+                            for outcomes in self.model.predict(
+                                [
+                                    (contexts[slot], str(acquisition["action"]))
+                                    for slot, acquisition in zip(
+                                        round_slots, acquisitions, strict=True
+                                    )
+                                ],
+                                samples_per_request=1,
+                                do_sample=False,
+                                seed=point_generation_seed,
+                            )
+                        ]
 
-                    should_update = self.config.training.update_gate == "all_transitions" or (
-                        verdict is Verdict.DIFFERENT
-                    )
-                    metrics: dict[str, float] = {}
                     model_version_before = self.optimizer_step
-                    if should_update:
-                        for _ in range(self.config.training.updates_per_mistake):
-                            metrics = self.model.learn([experience])
-                        self.optimizer_step = int(metrics["optimizer_step"])
+                    jobs = [
+                        (
+                            environment_indices[slot],
+                            contexts[slot],
+                            str(acquisition["action"]),
+                            point_prediction,
+                            episode_ids[slot],
+                            global_step + index,
+                            acquisition,
+                        )
+                        for index, (slot, acquisition, point_prediction) in enumerate(
+                            zip(
+                                round_slots,
+                                acquisitions,
+                                point_predictions,
+                                strict=True,
+                            )
+                        )
+                    ]
+                    packets = self._step_and_judge_many(jobs)
 
-                    global_step += 1
-                    next_state = EnvironmentState.from_dict(packet["next_state"])
-                    self._log_event(
-                        "transition",
-                        episode=episode,
-                        global_step=global_step,
-                        optimizer_step=self.optimizer_step,
-                        model_version_before=model_version_before,
-                        model_version_after=self.optimizer_step,
-                        generation_seed=generation_seed,
-                        point_generation_seed=point_generation_seed,
-                        point_prediction_reused=point_prediction_reused,
-                        context=experience.context.to_dict(),
-                        action=experience.action,
-                        prediction=experience.predicted_observation,
-                        observation=experience.actual_observation,
-                        verdict=verdict.value,
-                        judge_confidence=packet["judge_confidence"],
-                        judge_rationale=packet["judge_rationale"],
-                        acquisition=packet["acquisition"],
-                        won=next_state.won,
-                        score=next_state.score,
-                        update_metrics=metrics,
-                    )
-                    context.append(experience.action, experience.actual_observation)
-                    state = next_state
+                    round_results: list[
+                        tuple[int, Experience, Verdict, EnvironmentState, dict[str, Any]]
+                    ] = []
+                    for slot, packet in zip(round_slots, packets, strict=True):
+                        experience = Experience.from_dict(packet["experience"])
+                        verdict = Verdict(packet["verdict"])
+                        next_state = EnvironmentState.from_dict(packet["next_state"])
+                        if verdict is Verdict.DIFFERENT:
+                            mistakes += 1
+                            self.recent_errors.append(1)
+                        elif verdict is Verdict.EQUIVALENT:
+                            self.recent_errors.append(0)
+                        else:
+                            uncertain += 1
+                        should_update = (
+                            self.config.training.update_gate == "all_transitions"
+                            or verdict is Verdict.DIFFERENT
+                        )
+                        if should_update:
+                            pending_updates.append(experience)
+                        round_results.append((slot, experience, verdict, next_state, packet))
 
-                    checkpoint_every = (
-                        self.config.training.checkpoint_every_environment_steps
-                    )
+                    metrics = apply_pending_updates(force=False)
+                    transition_records: list[tuple[str, dict[str, Any]]] = []
+                    for index, (
+                        slot,
+                        experience,
+                        verdict,
+                        next_state,
+                        packet,
+                    ) in enumerate(round_results):
+                        event_global_step = global_step + index + 1
+                        transition_records.append(
+                            (
+                                "transition",
+                                {
+                                    "episode": episode_ids[slot],
+                                    "environment_slot": environment_indices[slot],
+                                    "global_step": event_global_step,
+                                    "optimizer_step": self.optimizer_step,
+                                    "model_version_before": model_version_before,
+                                    "model_version_after": self.optimizer_step,
+                                    "generation_seed": generation_seed,
+                                    "point_generation_seed": point_generation_seed,
+                                    "point_prediction_reused": point_prediction_reused,
+                                    "context": experience.context.to_dict(),
+                                    "action": experience.action,
+                                    "prediction": experience.predicted_observation,
+                                    "observation": experience.actual_observation,
+                                    "verdict": verdict.value,
+                                    "judge_confidence": packet["judge_confidence"],
+                                    "judge_rationale": packet["judge_rationale"],
+                                    "acquisition": packet["acquisition"],
+                                    "won": next_state.won,
+                                    "score": next_state.score,
+                                    "update_metrics": metrics,
+                                    "pending_update_examples": len(pending_updates),
+                                },
+                            )
+                        )
+                        contexts[slot].append(experience.action, experience.actual_observation)
+                        states[slot] = next_state
+                    global_step += len(round_results)
+                    self._log_events(transition_records)
+                    active = [slot for slot in active if not states[slot].done]
+
+                    checkpoint_every = self.config.training.checkpoint_every_environment_steps
                     if (
                         checkpoint_every > 0
-                        and global_step > 0
-                        and global_step % checkpoint_every == 0
-                        and global_step != self.last_checkpoint_environment_step
+                        and global_step // checkpoint_every
+                        > self.last_checkpoint_environment_step // checkpoint_every
                     ):
                         checkpoint_due = True
                     if self._should_stop_from_error_rate():
-                        state = EnvironmentState(
-                            observation=state.observation,
-                            admissible_actions=state.admissible_actions,
-                            done=True,
-                            won=state.won,
-                            score=state.score,
-                            metadata={**state.metadata, "error_rate_stop": True},
+                        stop_requested = True
+                        break
+
+                completed_episodes = wave_end
+                self._log_events(
+                    [
+                        (
+                            "episode_end",
+                            {
+                                "episode": episode,
+                                "environment_slot": environment_index,
+                                "global_step": global_step,
+                                "won": state.won,
+                                "score": state.score,
+                            },
                         )
-                completed_episodes += 1
-                self._log_event(
-                    "episode_end",
-                    episode=episode,
-                    global_step=global_step,
-                    won=state.won,
-                    score=state.score,
+                        for episode, environment_index, state in zip(
+                            episode_ids, environment_indices, states, strict=True
+                        )
+                    ]
                 )
                 if checkpoint_due:
+                    apply_pending_updates(force=True)
                     self._checkpoint(
                         f"env_step_{global_step:06d}",
                         next_episode=completed_episodes,
@@ -456,8 +610,7 @@ class OnlineExperienceExperiment:
                     )
                     self.last_checkpoint_environment_step = global_step
                     checkpoint_due = False
-                if self._should_stop_from_error_rate():
-                    break
+            apply_pending_updates(force=True)
             self._checkpoint(
                 "final",
                 next_episode=completed_episodes,
@@ -473,7 +626,8 @@ class OnlineExperienceExperiment:
                 "uncertain_judgments": uncertain,
             }
         finally:
-            if self.is_main_process and self.environment is not None:
-                self.environment.close()
+            if self.is_main_process:
+                for environment in self.environments:
+                    environment.close()
             if self.logger is not None:
                 self.logger.close()

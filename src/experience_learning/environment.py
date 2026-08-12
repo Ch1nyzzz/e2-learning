@@ -14,7 +14,14 @@ from experience_learning.types import EnvironmentState
 class ALFWorldTextEnvironment:
     """Batch-size-one adapter over ALFWorld's TextWorld API."""
 
-    def __init__(self, config: EnvironmentConfig, seed: int):
+    def __init__(
+        self,
+        config: EnvironmentConfig,
+        seed: int,
+        *,
+        game_offset: int = 0,
+        game_stride: int = 1,
+    ):
         try:
             from alfworld.agents.environment import get_environment
         except ImportError as exc:
@@ -29,7 +36,12 @@ class ALFWorldTextEnvironment:
         np.random.seed(seed)
         builder = get_environment("AlfredTWEnv")(raw, train_eval=config.split)
         builder.game_files = sorted(builder.game_files)
+        if game_stride < 1 or not 0 <= game_offset < game_stride:
+            raise ValueError("game partition requires 0 <= offset < stride")
+        builder.game_files = builder.game_files[game_offset::game_stride]
         builder.num_games = len(builder.game_files)
+        if builder.num_games == 0:
+            raise RuntimeError(f"ALFWorld game partition {game_offset}/{game_stride} is empty")
         self._env = builder.init_env(batch_size=1)
         self._env.seed(seed)
         self._episode_steps = 0

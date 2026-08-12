@@ -40,6 +40,7 @@ class JudgeConfig:
     base_url: str | None = "${JUDGE_BASE_URL:-}"
     timeout_seconds: float = 60.0
     max_retries: int = 3
+    max_concurrency: int = 1
     cache_path: str = "outputs/judge_cache.sqlite3"
 
 
@@ -68,6 +69,7 @@ class TrainingConfig:
     max_grad_norm: float = 1.0
     micro_batch_size: int = 1
     gradient_accumulation_steps: int = 1
+    update_batch_size: int = 1
     updates_per_mistake: int = 1
     update_gate: str = "mistake_only"
     warmup_updates: int = 20
@@ -82,6 +84,7 @@ class ExperimentConfig:
     output_dir: str = "outputs/alfworld_qwen3_8b"
     max_episodes: int = 100
     max_environment_steps: int = 2000
+    parallel_environments: int = 1
     stop_error_rate_threshold: float | None = None
     stop_error_rate_window: int = 200
 
@@ -120,6 +123,8 @@ class AppConfig:
             raise ValueError("learning_rate must be positive")
         if self.training.updates_per_mistake < 1:
             raise ValueError("updates_per_mistake must be positive")
+        if self.training.update_batch_size < 1:
+            raise ValueError("update_batch_size must be positive")
         if self.training.checkpoint_every_environment_steps < 0:
             raise ValueError("checkpoint interval cannot be negative")
         if self.training.max_periodic_checkpoints_to_keep < 0:
@@ -132,16 +137,21 @@ class AppConfig:
             )
         if self.judge.max_retries < 1:
             raise ValueError("judge max_retries must be at least 1")
+        if self.judge.max_concurrency < 1:
+            raise ValueError("judge max_concurrency must be positive")
         if self.judge.provider == "openai_compatible" and not self.judge.model.strip():
             raise ValueError("JUDGE_MODEL must name the semantic judge model")
         if self.experiment.max_environment_steps < 1:
             raise ValueError("max_environment_steps must be positive")
+        if self.experiment.parallel_environments < 1:
+            raise ValueError("parallel_environments must be positive")
         if self.evaluation.batch_size < 1:
             raise ValueError("evaluation batch size must be positive")
 
 
 def _expand_env(value: Any) -> Any:
     if isinstance(value, str):
+
         def replace(match: re.Match[str]) -> str:
             name, default = match.group(1), match.group(2)
             return os.environ.get(name, default or "")

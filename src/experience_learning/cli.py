@@ -105,19 +105,26 @@ def main(argv: Sequence[str] | None = None) -> int:
         if is_main:
             print(json.dumps(result, indent=2, sort_keys=True))
         return 0
-    environment = None
+    environments = []
     judge = None
     startup = None
     if is_main:
         try:
-            environment = ALFWorldTextEnvironment(
-                config.environment, config.experiment.seed
-            )
+            parallelism = config.experiment.parallel_environments
+            for index in range(parallelism):
+                environments.append(
+                    ALFWorldTextEnvironment(
+                        config.environment,
+                        config.experiment.seed + index,
+                        game_offset=index,
+                        game_stride=parallelism,
+                    )
+                )
             judge = build_judge(config.judge)
             _write_resolved_config(config, config.experiment.output_dir)
             startup = {"phase": "OK"}
         except Exception as exc:
-            if environment is not None:
+            for environment in environments:
                 environment.close()
             startup = {
                 "phase": "STOP",
@@ -126,14 +133,12 @@ def main(argv: Sequence[str] | None = None) -> int:
             }
     startup = broadcast_object(startup)
     if startup["phase"] == "STOP":
-        raise RuntimeError(
-            f"training startup failed: {startup['error_type']}: {startup['error']}"
-        )
+        raise RuntimeError(f"training startup failed: {startup['error_type']}: {startup['error']}")
     result = OnlineExperienceExperiment(
         config=config,
         model=model,
         is_main_process=is_main,
-        environment=environment,
+        environment=environments,
         judge=judge,
     ).run()
     if is_main:
