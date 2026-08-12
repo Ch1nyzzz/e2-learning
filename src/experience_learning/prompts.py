@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import re
+
 from experience_learning.types import EpisodeContext
 
 WORLD_MODEL_SYSTEM_PROMPT = """You are a world model for a deterministic text environment.
@@ -76,4 +78,15 @@ def extract_policy_action(text: str, admissible_actions: tuple[str, ...]) -> str
         for action in admissible_actions
         if action.casefold().strip().rstrip(".") == normalized
     ]
-    return matches[0] if len(matches) == 1 else None
+    if len(matches) == 1:
+        return matches[0]
+
+    # Reasoning models can consume their budget immediately after </think> despite an explicit
+    # action tag instruction. Recover only an exact admissible command mentioned in the generated
+    # response, choosing its last occurrence. The action list itself is in the prompt, not `text`.
+    mentioned: list[tuple[int, str]] = []
+    folded = cleaned.casefold()
+    for action in admissible_actions:
+        pattern = rf"(?<![\w]){re.escape(action.casefold())}(?![\w])"
+        mentioned.extend((match.start(), action) for match in re.finditer(pattern, folded))
+    return max(mentioned, default=(-1, None), key=lambda item: item[0])[1]

@@ -67,6 +67,12 @@ def test_policy_action_parser_requires_an_admissible_exact_match() -> None:
     )
     assert extract_policy_action("<action>go to cabinet 1</action>", actions) is None
     assert extract_policy_action("reasoning only", actions) is None
+    assert (
+        extract_policy_action(
+            "I could open fridge 1, but the next action should be go to fridge 1.", actions
+        )
+        == "go to fridge 1"
+    )
 
 
 def test_success_evaluation_reports_both_step_budgets(tmp_path: Path) -> None:

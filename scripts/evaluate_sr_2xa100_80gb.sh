@@ -18,7 +18,7 @@ run_evaluation() {
     --split "${split}" \
     --max-steps 30 \
     --report-step 20 \
-    --max-action-tokens 256 \
+    --max-action-tokens 512 \
     --seed 42 \
     --output "${output_root}/${label}_${split}.jsonl" \
     "$@"
