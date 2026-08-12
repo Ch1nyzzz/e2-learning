@@ -27,7 +27,7 @@ judge:
 environment:
   config_path: configs/alfworld/base_config.yaml
   split: train
-  max_steps_per_episode: 50
+  max_steps_per_episode: 20
   excluded_actions: []
   max_candidate_actions: 0
 
