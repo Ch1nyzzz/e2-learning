@@ -34,6 +34,22 @@ class _CheckpointStateSink:
         del state_dict
 
 
+def _load_model_only_accelerator_state(accelerator: Any, checkpoint: str) -> None:
+    """Restore an Accelerate checkpoint without applying its optimizer state.
+
+    FSDP2 requires an optimizer during ``prepare`` even for inference, so Accelerate
+    registers the throwaway preparation optimizer. Temporarily hiding that optimizer
+    lets ``load_state`` restore the sharded model while skipping the incompatible
+    training optimizer checkpoint.
+    """
+    optimizers = accelerator._optimizers
+    accelerator._optimizers = []
+    try:
+        accelerator.load_state(checkpoint)
+    finally:
+        accelerator._optimizers = optimizers
+
+
 def valid_generated_token_mask(
     generated_tokens: Any,
     *,
@@ -193,7 +209,12 @@ class TransformersWorldModel:
             self.scheduler = None
             self.accelerator.register_for_checkpointing(_CheckpointStateSink())
         if config.training.resume_from:
-            self.accelerator.load_state(config.training.resume_from)
+            if training:
+                self.accelerator.load_state(config.training.resume_from)
+            else:
+                _load_model_only_accelerator_state(
+                    self.accelerator, config.training.resume_from
+                )
             controller_path = Path(config.training.resume_from) / "controller_state.json"
             if controller_path.exists():
                 controller = json.loads(controller_path.read_text(encoding="utf-8"))
