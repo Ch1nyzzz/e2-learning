@@ -150,6 +150,22 @@ The summary reports conservative semantic accuracy (uncertain counts as incorrec
 accuracy upper bound, definite-decision accuracy, judge coverage, and target-observation token NLL.
 Retain the per-transition JSONL to audit judge errors.
 
+## End-to-end ALFWorld success rate
+
+After training, run a single-seed paired comparison of the unchanged base model and final
+checkpoint on all 140 `valid_seen` and all 134 `valid_unseen` games:
+
+```bash
+bash scripts/evaluate_sr_2xa100_80gb.sh
+```
+
+The deterministic ReAct policy sees the same admissible actions and game order for both models.
+Each rollout runs for at most 30 environment steps and the summary reports both `SR@20` and
+`SR@30`, invalid-action rate, mean successful trajectory length, and per-task-type success. This
+evaluation uses environment task completion directly and does not call the semantic judge. Raw
+trajectories and adjacent `*.summary.json` files are written below
+`outputs/alfworld_qwen3_8b_parallel8/sr_eval/`.
+
 ## Local checks
 
 The tests do not download a language model or ALFWorld data:

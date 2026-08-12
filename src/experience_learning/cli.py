@@ -6,7 +6,7 @@ from collections.abc import Sequence
 from dataclasses import asdict
 from pathlib import Path
 
-from experience_learning.config import load_config
+from experience_learning.config import EnvironmentConfig, load_config
 
 
 def _parser() -> argparse.ArgumentParser:
@@ -34,6 +34,23 @@ def _parser() -> argparse.ArgumentParser:
     evaluate.add_argument("--checkpoint")
     evaluate.add_argument("--probes", required=True)
     evaluate.add_argument("--output", required=True)
+    success = subparsers.add_parser(
+        "evaluate-sr", help="evaluate deterministic ALFWorld task success rate"
+    )
+    success.add_argument("--config", required=True)
+    success.add_argument("--set", action="append", default=[], dest="overrides")
+    success.add_argument("--checkpoint")
+    success.add_argument(
+        "--split",
+        required=True,
+        choices=["eval_in_distribution", "eval_out_of_distribution"],
+    )
+    success.add_argument("--episodes", type=int, default=0)
+    success.add_argument("--max-steps", type=int, default=30)
+    success.add_argument("--report-step", type=int, default=20)
+    success.add_argument("--max-action-tokens", type=int, default=256)
+    success.add_argument("--seed", type=int, default=42)
+    success.add_argument("--output", required=True)
     return parser
 
 
@@ -70,10 +87,65 @@ def main(argv: Sequence[str] | None = None) -> int:
     from experience_learning.judge import build_judge
     from experience_learning.model import TransformersWorldModel
 
-    if args.command == "evaluate-probes" and args.checkpoint:
+    if args.command in {"evaluate-probes", "evaluate-sr"} and args.checkpoint:
         config.training.resume_from = args.checkpoint
     model = TransformersWorldModel(config, training=args.command == "train")
     is_main = model.accelerator.is_main_process
+    if args.command == "evaluate-sr":
+        from experience_learning.success_evaluation import evaluate_success_rate
+
+        official_counts = {
+            "eval_in_distribution": 140,
+            "eval_out_of_distribution": 134,
+        }
+        episodes = args.episodes or official_counts[args.split]
+        parallelism = min(config.experiment.parallel_environments, episodes)
+        environments = []
+        startup = None
+        if is_main:
+            try:
+                env_config = EnvironmentConfig(**vars(config.environment))
+                env_config.split = args.split
+                env_config.max_steps_per_episode = args.max_steps
+                for index in range(parallelism):
+                    environments.append(
+                        ALFWorldTextEnvironment(
+                            env_config,
+                            args.seed + index,
+                            game_offset=index,
+                            game_stride=parallelism,
+                        )
+                    )
+                startup = {"phase": "OK"}
+            except Exception as exc:
+                for environment in environments:
+                    environment.close()
+                startup = {
+                    "phase": "STOP",
+                    "error_type": type(exc).__name__,
+                    "error": str(exc),
+                }
+        startup = broadcast_object(startup)
+        if startup["phase"] == "STOP":
+            raise RuntimeError(
+                f"SR evaluation startup failed: {startup['error_type']}: {startup['error']}"
+            )
+        result = evaluate_success_rate(
+            model=model,
+            environments=environments,
+            is_main_process=is_main,
+            split=args.split,
+            episodes=episodes,
+            parallelism=parallelism,
+            max_steps=args.max_steps,
+            report_step=args.report_step,
+            max_action_tokens=args.max_action_tokens,
+            seed=args.seed,
+            output_path=args.output,
+        )
+        if is_main:
+            print(json.dumps(result, indent=2, sort_keys=True))
+        return 0
     if args.command == "evaluate-probes":
         from experience_learning.evaluation import evaluate_probes
 

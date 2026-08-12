@@ -9,8 +9,19 @@ from typing import Any
 
 from experience_learning.config import AppConfig
 from experience_learning.distributed import all_gather_objects
-from experience_learning.prompts import extract_observation, prediction_messages, training_target
-from experience_learning.types import EpisodeContext, Experience, TokenEntropyPrediction
+from experience_learning.prompts import (
+    extract_observation,
+    extract_policy_action,
+    policy_messages,
+    prediction_messages,
+    training_target,
+)
+from experience_learning.types import (
+    EpisodeContext,
+    Experience,
+    PolicyDecision,
+    TokenEntropyPrediction,
+)
 
 
 class _CheckpointStateSink:
@@ -266,6 +277,40 @@ class TransformersWorldModel:
             )
         return best
 
+    def _fit_policy_prompt(
+        self,
+        context: EpisodeContext,
+        admissible_actions: tuple[str, ...],
+        *,
+        max_tokens: int,
+    ) -> str:
+        def encode(prompt_context: EpisodeContext) -> tuple[str, int]:
+            messages = policy_messages(prompt_context, admissible_actions)
+            kwargs: dict[str, Any] = {"tokenize": False, "add_generation_prompt": True}
+            try:
+                prompt = self.tokenizer.apply_chat_template(
+                    messages, enable_thinking=True, **kwargs
+                )
+            except TypeError:
+                prompt = self.tokenizer.apply_chat_template(messages, **kwargs)
+            return prompt, len(self.tokenizer.encode(prompt, add_special_tokens=False))
+
+        retained_history = list(context.history)
+        while True:
+            packed = EpisodeContext(
+                initial_observation=context.initial_observation,
+                history=list(retained_history),
+            )
+            prompt, length = encode(packed)
+            if length <= max_tokens:
+                return prompt
+            if retained_history:
+                retained_history.pop(0)
+                continue
+            raise ValueError(
+                "model.max_context_tokens is too small for the policy prompt and action list"
+            )
+
     @staticmethod
     def _balanced_slice(total: int, world_size: int, rank: int) -> tuple[int, int, int]:
         per_rank = max(1, math.ceil(total / world_size))
@@ -318,6 +363,105 @@ class TransformersWorldModel:
                 hit_token_limits,
                 strict=True,
             )
+        ]
+
+    def choose_actions(
+        self,
+        requests: Sequence[tuple[EpisodeContext, tuple[str, ...]]],
+        *,
+        max_new_tokens: int,
+        do_sample: bool,
+        seed: int | None = None,
+    ) -> list[PolicyDecision]:
+        import torch
+
+        if not requests:
+            return []
+        if max_new_tokens < 1 or max_new_tokens >= self.config.model.max_context_tokens:
+            raise ValueError("policy max_new_tokens must fit inside the model context")
+        if seed is not None:
+            torch.manual_seed(seed + self.rank)
+            if torch.cuda.is_available():
+                torch.cuda.manual_seed_all(seed + self.rank)
+        start, end, per_rank = self._balanced_slice(len(requests), self.world_size, self.rank)
+        indexed = list(enumerate(requests))
+        while len(indexed) < per_rank * self.world_size:
+            indexed.append((-1, requests[0]))
+        local = indexed[start:end]
+        prompt_budget = self.config.model.max_context_tokens - max_new_tokens
+        prompts = [
+            self._fit_policy_prompt(context, actions, max_tokens=prompt_budget)
+            for _, (context, actions) in local
+        ]
+        old_padding_side = self.tokenizer.padding_side
+        old_truncation_side = self.tokenizer.truncation_side
+        self.tokenizer.padding_side = "left"
+        self.tokenizer.truncation_side = "left"
+        self.model.eval()
+        unwrapped = self.accelerator.unwrap_model(self.model)
+        if self.config.model.gradient_checkpointing:
+            unwrapped.gradient_checkpointing_disable()
+        local_results: list[tuple[int, str, str | None]] = []
+        generation_kwargs: dict[str, Any] = {
+            "max_new_tokens": max_new_tokens,
+            "do_sample": do_sample,
+            "use_cache": True,
+            "synced_gpus": self.world_size > 1,
+            "pad_token_id": self.tokenizer.pad_token_id,
+            "eos_token_id": self.tokenizer.eos_token_id,
+        }
+        if do_sample:
+            generation_kwargs.update(
+                temperature=self.config.generation.temperature,
+                top_p=self.config.generation.top_p,
+            )
+        try:
+            micro_batch_size = self.config.generation.micro_batch_size
+            for chunk_start in range(0, len(local), micro_batch_size):
+                chunk_local = local[chunk_start : chunk_start + micro_batch_size]
+                encoded = self.tokenizer(
+                    prompts[chunk_start : chunk_start + micro_batch_size],
+                    padding=True,
+                    return_tensors="pt",
+                ).to(self.accelerator.device)
+                with torch.no_grad():
+                    generated = unwrapped.generate(**encoded, **generation_kwargs)
+                prompt_length = encoded["input_ids"].shape[1]
+                decoded = self.tokenizer.batch_decode(
+                    generated[:, prompt_length:], skip_special_tokens=True
+                )
+                for (global_index, (_, actions)), raw_response in zip(
+                    chunk_local, decoded, strict=True
+                ):
+                    if global_index >= 0:
+                        local_results.append(
+                            (
+                                global_index,
+                                raw_response.strip(),
+                                extract_policy_action(raw_response, actions),
+                            )
+                        )
+        finally:
+            if self.config.model.gradient_checkpointing:
+                unwrapped.gradient_checkpointing_enable()
+            if self.training_enabled:
+                self.model.train()
+            else:
+                self.model.eval()
+            self.tokenizer.padding_side = old_padding_side
+            self.tokenizer.truncation_side = old_truncation_side
+        flattened = [
+            item for rank_items in all_gather_objects(local_results) for item in rank_items
+        ]
+        flattened.sort(key=lambda item: item[0])
+        if len(flattened) != len(requests):
+            raise RuntimeError(
+                f"distributed policy generation lost requests: expected {len(requests)}, "
+                f"got {len(flattened)}"
+            )
+        return [
+            PolicyDecision(raw_response=raw, action=action)
+            for _, raw, action in flattened
         ]
 
     def _predict(

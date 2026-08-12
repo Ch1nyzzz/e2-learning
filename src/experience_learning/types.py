@@ -105,6 +105,12 @@ class TokenEntropyPrediction:
 
 
 @dataclass(frozen=True)
+class PolicyDecision:
+    raw_response: str
+    action: str | None
+
+
+@dataclass(frozen=True)
 class AcquisitionDecision:
     action: str
     score: float

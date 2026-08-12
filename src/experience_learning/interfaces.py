@@ -8,6 +8,7 @@ from experience_learning.types import (
     EpisodeContext,
     Experience,
     JudgeResult,
+    PolicyDecision,
     TokenEntropyPrediction,
 )
 
@@ -33,6 +34,14 @@ class WorldModel(Protocol):
         *,
         seed: int | None = None,
     ) -> list[TokenEntropyPrediction]: ...
+    def choose_actions(
+        self,
+        requests: Sequence[tuple[EpisodeContext, tuple[str, ...]]],
+        *,
+        max_new_tokens: int,
+        do_sample: bool,
+        seed: int | None = None,
+    ) -> list[PolicyDecision]: ...
     def learn(self, experiences: Sequence[Experience]) -> dict[str, float]: ...
     def score(self, experiences: Sequence[Experience]) -> dict[str, float]: ...
     def save(self, output_dir: str) -> None: ...
