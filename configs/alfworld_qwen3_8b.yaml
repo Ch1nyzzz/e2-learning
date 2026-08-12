@@ -48,6 +48,7 @@ training:
   update_gate: mistake_only
   warmup_updates: 20
   checkpoint_every_environment_steps: 100
+  max_periodic_checkpoints_to_keep: 3
   resume_from: null
 
 experiment:

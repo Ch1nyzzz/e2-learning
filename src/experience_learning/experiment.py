@@ -3,6 +3,7 @@ from __future__ import annotations
 import ast
 import json
 import random
+import shutil
 from collections import deque
 from dataclasses import asdict
 from pathlib import Path
@@ -234,9 +235,31 @@ class OnlineExperienceExperiment:
                 encoding="utf-8",
             )
             self.logger.write("checkpoint", path=str(path), optimizer_step=self.optimizer_step)
+            pruned = self._prune_periodic_checkpoints()
+            if pruned:
+                self.logger.write("checkpoint_pruned", paths=pruned)
             return {}
 
         self._controller_packet(operation)
+
+    def _prune_periodic_checkpoints(self) -> list[str]:
+        """Keep only the newest configured number of env-step checkpoints."""
+        keep = self.config.training.max_periodic_checkpoints_to_keep
+        if keep == 0:
+            return []
+        checkpoint_root = self.output_dir / "checkpoints"
+        periodic = sorted(
+            path
+            for path in checkpoint_root.iterdir()
+            if path.is_dir()
+            and path.name.startswith("env_step_")
+            and path.name.removeprefix("env_step_").isdigit()
+        )
+        removed: list[str] = []
+        for path in periodic[:-keep]:
+            shutil.rmtree(path)
+            removed.append(str(path))
+        return removed
 
     def _resume_state(self) -> dict[str, Any]:
         default = {

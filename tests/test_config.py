@@ -33,3 +33,10 @@ def test_exact_match_smoke_judge_does_not_require_api_model() -> None:
 
 def test_token_entropy_is_the_default_acquisition() -> None:
     assert AppConfig().acquisition.strategy == "token_entropy"
+
+
+def test_checkpoint_retention_cannot_be_negative() -> None:
+    config = AppConfig()
+    config.training.max_periodic_checkpoints_to_keep = -1
+    with pytest.raises(ValueError, match="checkpoint retention"):
+        config.validate()

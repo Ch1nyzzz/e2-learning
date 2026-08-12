@@ -72,6 +72,7 @@ class TrainingConfig:
     update_gate: str = "mistake_only"
     warmup_updates: int = 20
     checkpoint_every_environment_steps: int = 100
+    max_periodic_checkpoints_to_keep: int = 3
     resume_from: str | None = None
 
 
@@ -121,6 +122,8 @@ class AppConfig:
             raise ValueError("updates_per_mistake must be positive")
         if self.training.checkpoint_every_environment_steps < 0:
             raise ValueError("checkpoint interval cannot be negative")
+        if self.training.max_periodic_checkpoints_to_keep < 0:
+            raise ValueError("checkpoint retention cannot be negative")
         if self.training.update_gate not in {"mistake_only", "all_transitions"}:
             raise ValueError("update_gate must be mistake_only or all_transitions")
         if self.acquisition.strategy not in {"token_entropy", "semantic_entropy", "random"}:

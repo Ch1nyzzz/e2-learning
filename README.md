@@ -106,6 +106,10 @@ checkpoints/
   final/
 ```
 
+Periodic checkpoint retention defaults to the newest three checkpoints via
+`training.max_periodic_checkpoints_to_keep`; the final checkpoint is retained separately. Set the
+value to `0` only when unlimited periodic checkpoint history is intentional.
+
 ## Held-out transition evaluation
 
 Create fixed probe sets before training so every method/seed is evaluated on identical

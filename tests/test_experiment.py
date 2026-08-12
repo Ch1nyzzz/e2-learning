@@ -173,3 +173,21 @@ def test_token_entropy_selects_highest_score_and_only_judges_execution(
     candidate = transitions[0]["acquisition"]["predictions"][0]
     assert candidate["generated_tokens"] == 12
     assert candidate["hit_token_limit"] is False
+
+
+def test_periodic_checkpoint_retention_keeps_newest_and_final(tmp_path: Path) -> None:
+    config = _config(tmp_path)
+    config.experiment.max_episodes = 5
+    config.experiment.max_environment_steps = 5
+    config.training.checkpoint_every_environment_steps = 1
+    config.training.max_periodic_checkpoints_to_keep = 2
+    OnlineExperienceExperiment(
+        config=config,
+        model=FakeModel(correct=True),
+        is_main_process=True,
+        environment=FakeEnvironment("real"),
+        judge=ExactMatchJudge(),
+    ).run()
+
+    checkpoint_names = sorted(path.name for path in (tmp_path / "checkpoints").iterdir())
+    assert checkpoint_names == ["env_step_000004", "env_step_000005", "final"]
