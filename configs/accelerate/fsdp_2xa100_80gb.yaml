@@ -12,7 +12,8 @@ same_network: true
 use_cpu: false
 fsdp_config:
   fsdp_version: 2
-  fsdp_reshard_after_forward: false
+  # Two ranks otherwise retain full parameters and leave too little headroom for AdamW/backward.
+  fsdp_reshard_after_forward: true
   fsdp_auto_wrap_policy: TRANSFORMER_BASED_WRAP
   fsdp_cpu_ram_efficient_loading: true
   fsdp_cpu_offload: false
