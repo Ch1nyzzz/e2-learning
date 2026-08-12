@@ -10,6 +10,7 @@ from experience_learning.types import (
     ActionPrediction,
     JudgeResult,
     SemanticCluster,
+    TokenEntropyPrediction,
 )
 
 CompareFn = Callable[[str, str], JudgeResult]
@@ -68,6 +69,35 @@ def semantic_entropy(clusters: Sequence[SemanticCluster], total: int) -> float:
         if probability > 0:
             entropy -= probability * math.log(probability)
     return entropy
+
+
+def select_by_token_entropy(
+    predictions_by_action: Mapping[str, TokenEntropyPrediction],
+    *,
+    rng: random.Random,
+) -> AcquisitionDecision:
+    """Select the action with maximum mean next-token entropy."""
+    if not predictions_by_action:
+        raise ValueError("cannot acquire from an empty action set")
+    action_predictions = [
+        ActionPrediction(
+            action=action,
+            samples=(prediction.observation,),
+            clusters=(),
+            entropy=prediction.mean_token_entropy,
+            generated_tokens=prediction.generated_tokens,
+            hit_token_limit=prediction.hit_token_limit,
+        )
+        for action, prediction in predictions_by_action.items()
+    ]
+    best_score = max(item.entropy for item in action_predictions)
+    tied = [item for item in action_predictions if math.isclose(item.entropy, best_score)]
+    chosen = rng.choice(tied)
+    return AcquisitionDecision(
+        action=chosen.action,
+        score=chosen.entropy,
+        predictions=tuple(action_predictions),
+    )
 
 
 def select_by_semantic_entropy(

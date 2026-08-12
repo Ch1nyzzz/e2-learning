@@ -1,4 +1,12 @@
-from experience_learning.model import TransformersWorldModel, build_causal_training_sequence
+import math
+
+import pytest
+
+from experience_learning.model import (
+    TransformersWorldModel,
+    build_causal_training_sequence,
+    mean_generated_token_entropy,
+)
 from experience_learning.types import EpisodeContext
 
 
@@ -29,6 +37,24 @@ def test_long_prompt_is_left_truncated_but_target_is_preserved() -> None:
     )
     assert input_ids == [3, 4, 5, 6, 7]
     assert labels == [-100, -100, 5, 6, 7]
+
+
+def test_mean_token_entropy_includes_first_eos_and_excludes_later_padding() -> None:
+    torch = pytest.importorskip("torch")
+    logits = (
+        torch.tensor([[0.0, 0.0], [0.0, 0.0]]),
+        torch.tensor([[0.0, 0.0], [100.0, -100.0]]),
+    )
+    generated_tokens = torch.tensor([[1, 1], [0, 1]])
+
+    entropies = mean_generated_token_entropy(
+        logits,
+        generated_tokens,
+        eos_token_id=1,
+    )
+
+    assert entropies[0].item() == pytest.approx(math.log(2))
+    assert entropies[1].item() == pytest.approx(math.log(2) / 2)
 
 
 def test_structured_prompt_packing_keeps_latest_state_and_action() -> None:

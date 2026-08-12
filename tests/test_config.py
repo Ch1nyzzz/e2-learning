@@ -29,3 +29,7 @@ def test_exact_match_smoke_judge_does_not_require_api_model() -> None:
     config.judge.provider = "exact_match"
     config.judge.model = ""
     config.validate()
+
+
+def test_token_entropy_is_the_default_acquisition() -> None:
+    assert AppConfig().acquisition.strategy == "token_entropy"

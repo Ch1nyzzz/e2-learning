@@ -8,7 +8,7 @@ from dataclasses import asdict
 from pathlib import Path
 from typing import Any
 
-from experience_learning.acquisition import select_by_semantic_entropy
+from experience_learning.acquisition import select_by_semantic_entropy, select_by_token_entropy
 from experience_learning.config import AppConfig
 from experience_learning.distributed import broadcast_object
 from experience_learning.environment import filter_actions
@@ -18,6 +18,7 @@ from experience_learning.types import (
     EnvironmentState,
     EpisodeContext,
     Experience,
+    TokenEntropyPrediction,
     Verdict,
 )
 
@@ -105,10 +106,23 @@ class OnlineExperienceExperiment:
         context: EpisodeContext,
         actions: tuple[str, ...],
         predictions: list[list[str]],
+        token_predictions: list[TokenEntropyPrediction] | None = None,
     ) -> dict[str, Any]:
         def operation() -> dict[str, Any]:
             assert self.judge is not None
             predictions_by_action = dict(zip(actions, predictions, strict=True))
+            if self.config.acquisition.strategy == "token_entropy":
+                if token_predictions is None or len(token_predictions) != len(actions):
+                    raise ValueError("token entropy acquisition requires one score per action")
+                decision = select_by_token_entropy(
+                    dict(zip(actions, token_predictions, strict=True)),
+                    rng=self.rng,
+                )
+                return {
+                    "action": decision.action,
+                    "score": decision.score,
+                    "predictions": [asdict(item) for item in decision.predictions],
+                }
             if self.config.acquisition.strategy == "random":
                 action = self.rng.choice(list(actions))
                 return {
@@ -293,24 +307,40 @@ class OnlineExperienceExperiment:
                     if not actions:
                         break
                     generation_seed = self.config.experiment.seed + global_step * 1009
-                    predictions = self.model.predict(
-                        [(context, action) for action in actions],
-                        samples_per_request=self.config.generation.samples_per_action,
-                        do_sample=True,
-                        seed=generation_seed,
-                    )
+                    token_predictions: list[TokenEntropyPrediction] | None = None
+                    if self.config.acquisition.strategy == "token_entropy":
+                        token_predictions = self.model.predict_with_token_entropy(
+                            [(context, action) for action in actions],
+                            seed=generation_seed,
+                        )
+                        predictions = [[item.observation] for item in token_predictions]
+                    else:
+                        predictions = self.model.predict(
+                            [(context, action) for action in actions],
+                            samples_per_request=self.config.generation.samples_per_action,
+                            do_sample=True,
+                            seed=generation_seed,
+                        )
                     acquisition = self._select_action(
                         context=context,
                         actions=actions,
                         predictions=predictions,
+                        token_predictions=token_predictions,
                     )
-                    point_generation_seed = generation_seed + 1
-                    point_prediction = self.model.predict(
-                        [(context, str(acquisition["action"]))],
-                        samples_per_request=1,
-                        do_sample=False,
-                        seed=point_generation_seed,
-                    )[0][0]
+                    if self.config.acquisition.strategy == "token_entropy":
+                        chosen_index = actions.index(str(acquisition["action"]))
+                        point_generation_seed = generation_seed
+                        point_prediction = predictions[chosen_index][0]
+                        point_prediction_reused = True
+                    else:
+                        point_generation_seed = generation_seed + 1
+                        point_prediction = self.model.predict(
+                            [(context, str(acquisition["action"]))],
+                            samples_per_request=1,
+                            do_sample=False,
+                            seed=point_generation_seed,
+                        )[0][0]
+                        point_prediction_reused = False
                     packet = self._step_and_judge(
                         context=context,
                         action=str(acquisition["action"]),
@@ -350,6 +380,7 @@ class OnlineExperienceExperiment:
                         model_version_after=self.optimizer_step,
                         generation_seed=generation_seed,
                         point_generation_seed=point_generation_seed,
+                        point_prediction_reused=point_prediction_reused,
                         context=experience.context.to_dict(),
                         action=experience.action,
                         prediction=experience.predicted_observation,

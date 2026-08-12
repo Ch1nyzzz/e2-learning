@@ -92,6 +92,16 @@ class ActionPrediction:
     samples: tuple[str, ...]
     clusters: tuple[SemanticCluster, ...]
     entropy: float
+    generated_tokens: int | None = None
+    hit_token_limit: bool | None = None
+
+
+@dataclass(frozen=True)
+class TokenEntropyPrediction:
+    observation: str
+    mean_token_entropy: float
+    generated_tokens: int
+    hit_token_limit: bool
 
 
 @dataclass(frozen=True)
@@ -130,4 +140,3 @@ class Experience:
             step=int(value.get("step", 0)),
             episode=int(value.get("episode", 0)),
         )
-

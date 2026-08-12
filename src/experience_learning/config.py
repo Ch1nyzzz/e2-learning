@@ -54,7 +54,7 @@ class EnvironmentConfig:
 
 @dataclass
 class AcquisitionConfig:
-    strategy: str = "semantic_entropy"
+    strategy: str = "token_entropy"
     uncertain_comparisons_are_distinct: bool = True
     normalize_entropy: bool = True
 
@@ -123,8 +123,10 @@ class AppConfig:
             raise ValueError("checkpoint interval cannot be negative")
         if self.training.update_gate not in {"mistake_only", "all_transitions"}:
             raise ValueError("update_gate must be mistake_only or all_transitions")
-        if self.acquisition.strategy not in {"semantic_entropy", "random"}:
-            raise ValueError("acquisition strategy must be semantic_entropy or random")
+        if self.acquisition.strategy not in {"token_entropy", "semantic_entropy", "random"}:
+            raise ValueError(
+                "acquisition strategy must be token_entropy, semantic_entropy, or random"
+            )
         if self.judge.max_retries < 1:
             raise ValueError("judge max_retries must be at least 1")
         if self.judge.provider == "openai_compatible" and not self.judge.model.strip():

@@ -1,16 +1,23 @@
+import json
 from collections.abc import Sequence
 from pathlib import Path
 
 from experience_learning.config import AppConfig
 from experience_learning.experiment import OnlineExperienceExperiment
 from experience_learning.judge import ExactMatchJudge
-from experience_learning.types import EnvironmentState, EpisodeContext, Experience
+from experience_learning.types import (
+    EnvironmentState,
+    EpisodeContext,
+    Experience,
+    TokenEntropyPrediction,
+)
 
 
 class FakeEnvironment:
     def __init__(self, actual: str):
         self.actual = actual
         self.step_calls = 0
+        self.last_action: str | None = None
         self.closed = False
 
     def reset(self) -> EnvironmentState:
@@ -18,6 +25,7 @@ class FakeEnvironment:
 
     def step(self, action: str) -> EnvironmentState:
         self.step_calls += 1
+        self.last_action = action
         assert action in {"certain", "uncertain"}
         return EnvironmentState(self.actual, (), done=True)
 
@@ -51,6 +59,24 @@ class FakeModel:
             else:
                 results.append(["wrong", "wrong", "wrong", "other"])
         return results
+
+    def predict_with_token_entropy(
+        self,
+        requests: Sequence[tuple[EpisodeContext, str]],
+        *,
+        seed: int | None = None,
+    ) -> list[TokenEntropyPrediction]:
+        del seed
+        prediction = "real" if self.correct else "wrong"
+        return [
+            TokenEntropyPrediction(
+                observation=prediction,
+                mean_token_entropy=0.1 if action == "certain" else 0.9,
+                generated_tokens=12,
+                hit_token_limit=False,
+            )
+            for _, action in requests
+        ]
 
     def learn(self, experiences: Sequence[Experience]) -> dict[str, float]:
         assert experiences
@@ -123,3 +149,27 @@ def test_random_acquisition_skips_entropy_judge_calls(tmp_path: Path) -> None:
         judge=judge,
     ).run()
     assert judge.calls == 1
+
+
+def test_token_entropy_selects_highest_score_and_only_judges_execution(
+    tmp_path: Path,
+) -> None:
+    judge = CountingJudge()
+    environment = FakeEnvironment("real")
+    OnlineExperienceExperiment(
+        config=_config(tmp_path),
+        model=FakeModel(correct=True),
+        is_main_process=True,
+        environment=environment,
+        judge=judge,
+    ).run()
+    assert environment.last_action == "uncertain"
+    assert judge.calls == 1
+    transitions = [
+        json.loads(line)
+        for line in (tmp_path / "events.jsonl").read_text(encoding="utf-8").splitlines()
+        if json.loads(line)["event"] == "transition"
+    ]
+    candidate = transitions[0]["acquisition"]["predictions"][0]
+    assert candidate["generated_tokens"] == 12
+    assert candidate["hit_token_limit"] is False

@@ -6,12 +6,12 @@ mistake-driven experience learning** in the deterministic ALFWorld TextWorld env
 The training loop is intentionally not GRPO/PPO:
 
 1. enumerate ALFWorld's admissible actions;
-2. sample `K` next-observation predictions for every action;
-3. cluster predictions by semantic consequence and choose the action with maximum normalized
-   semantic sample entropy;
+2. greedily predict the next observation for every action while measuring the model's mean
+   next-token entropy;
+3. choose the action with maximum mean token entropy;
 4. execute that action in the real environment exactly once;
-5. make one independent greedy point prediction, then compare it with the real observation using
-   a constrained OpenAI-compatible semantic judge;
+5. compare the selected action's greedy prediction with the real observation using a constrained
+   OpenAI-compatible semantic judge;
 6. perform a full-parameter next-observation update only when reality contradicts the model.
 
 The external judge is only a semantic equivalence checker. ALFWorld remains the source of the
@@ -21,7 +21,7 @@ training target.
 
 - ALFWorld `AlfredTWEnv`, all six supported task families
 - train / valid-seen / valid-unseen split support
-- semantic-entropy and random acquisition strategies
+- token-entropy, semantic-sample-entropy, and random acquisition strategies
 - mistake-only and all-transition update gates for the 2x2 ablation
 - full-parameter Hugging Face training; LoRA/PEFT parameters are explicitly rejected
 - four-process Accelerate FSDP2 configuration for 4 x A100 80GB
@@ -65,13 +65,21 @@ seed:
 | --- | --- | --- |
 | `random` | `all_transitions` | uniform data + ordinary next-observation SFT |
 | `random` | `mistake_only` | isolates mistake gating |
-| `semantic_entropy` | `all_transitions` | isolates active acquisition |
-| `semantic_entropy` | `mistake_only` | proposed method |
+| `token_entropy` | `all_transitions` | isolates active acquisition |
+| `token_entropy` | `mistake_only` | proposed method |
 
 Set the two fields with `--set acquisition.strategy=...` and
 `--set training.update_gate=...`, and give every run a distinct `experiment.output_dir`. Random
 acquisition still generates every candidate so model-generation compute remains comparable, but it
 skips acquisition-time semantic clustering and its API cost.
+
+Token-entropy acquisition performs one greedy prediction per candidate action, averages the full
+vocabulary entropy over valid generated tokens, and reuses the selected action's prediction for the
+reality check. The external judge is therefore called only after the selected action is executed.
+Each candidate log also records `generated_tokens` and `hit_token_limit`, making it possible to
+measure how often generation reaches `generation.max_new_tokens` without emitting EOS.
+The older `semantic_entropy` strategy remains available as a higher-cost ablation; it samples
+`generation.samples_per_action` outcomes and uses the judge to cluster every pair before selection.
 
 ## Reproducibility and safety boundaries
 

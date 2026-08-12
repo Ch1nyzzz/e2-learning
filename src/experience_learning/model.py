@@ -10,7 +10,7 @@ from typing import Any
 from experience_learning.config import AppConfig
 from experience_learning.distributed import all_gather_objects
 from experience_learning.prompts import extract_observation, prediction_messages, training_target
-from experience_learning.types import EpisodeContext, Experience
+from experience_learning.types import EpisodeContext, Experience, TokenEntropyPrediction
 
 
 class _CheckpointStateSink:
@@ -21,6 +21,56 @@ class _CheckpointStateSink:
 
     def load_state_dict(self, state_dict: dict[str, Any]) -> None:
         del state_dict
+
+
+def valid_generated_token_mask(
+    generated_tokens: Any,
+    *,
+    eos_token_id: int | Sequence[int] | None,
+) -> tuple[Any, Any]:
+    """Return the through-first-EOS token mask and whether each sequence emitted EOS."""
+    import torch
+
+    valid = torch.ones_like(generated_tokens, dtype=torch.bool)
+    has_eos = torch.zeros(
+        generated_tokens.shape[0], dtype=torch.bool, device=generated_tokens.device
+    )
+    if eos_token_id is not None:
+        eos_ids = (
+            list(eos_token_id)
+            if isinstance(eos_token_id, Sequence) and not isinstance(eos_token_id, (str, bytes))
+            else [eos_token_id]
+        )
+        is_eos = torch.zeros_like(generated_tokens, dtype=torch.bool)
+        for token_id in eos_ids:
+            is_eos |= generated_tokens.eq(token_id)
+        has_eos = is_eos.any(dim=1)
+        prior_eos = is_eos.cumsum(dim=1) - is_eos.to(dtype=torch.long)
+        valid &= prior_eos.eq(0)
+    return valid, has_eos
+
+
+def mean_generated_token_entropy(
+    logits: Sequence[Any],
+    generated_tokens: Any,
+    *,
+    eos_token_id: int | Sequence[int] | None,
+) -> Any:
+    """Average full-vocabulary entropy through the first EOS for each sequence."""
+    import torch
+
+    if not logits:
+        raise ValueError("token entropy requires at least one generation logit tensor")
+    step_entropies = torch.stack(
+        [torch.special.entr(step.float().softmax(dim=-1)).sum(dim=-1) for step in logits],
+        dim=1,
+    )
+    valid, _ = valid_generated_token_mask(
+        generated_tokens,
+        eos_token_id=eos_token_id,
+    )
+    valid_float = valid.to(dtype=step_entropies.dtype)
+    return (step_entropies * valid_float).sum(dim=1) / valid_float.sum(dim=1).clamp_min(1)
 
 
 def build_causal_training_sequence(
@@ -223,10 +273,68 @@ class TransformersWorldModel:
         do_sample: bool,
         seed: int | None = None,
     ) -> list[list[str]]:
+        predictions, _, _, _ = self._predict(
+            requests,
+            samples_per_request=samples_per_request,
+            do_sample=do_sample,
+            seed=seed,
+            return_token_entropy=False,
+        )
+        return predictions
+
+    def predict_with_token_entropy(
+        self,
+        requests: Sequence[tuple[EpisodeContext, str]],
+        *,
+        seed: int | None = None,
+    ) -> list[TokenEntropyPrediction]:
+        predictions, entropies, token_counts, hit_token_limits = self._predict(
+            requests,
+            samples_per_request=1,
+            do_sample=False,
+            seed=seed,
+            return_token_entropy=True,
+        )
+        assert entropies is not None
+        assert token_counts is not None
+        assert hit_token_limits is not None
+        return [
+            TokenEntropyPrediction(
+                observation=outcomes[0],
+                mean_token_entropy=entropy,
+                generated_tokens=token_count,
+                hit_token_limit=hit_token_limit,
+            )
+            for outcomes, entropy, token_count, hit_token_limit in zip(
+                predictions,
+                entropies,
+                token_counts,
+                hit_token_limits,
+                strict=True,
+            )
+        ]
+
+    def _predict(
+        self,
+        requests: Sequence[tuple[EpisodeContext, str]],
+        *,
+        samples_per_request: int,
+        do_sample: bool,
+        seed: int | None = None,
+        return_token_entropy: bool,
+    ) -> tuple[
+        list[list[str]],
+        list[float] | None,
+        list[int] | None,
+        list[bool] | None,
+    ]:
         import torch
 
         if not requests:
-            return []
+            empty = [] if return_token_entropy else None
+            return [], empty, empty, empty
+        if return_token_entropy and (samples_per_request != 1 or do_sample):
+            raise ValueError("token entropy prediction requires one greedy sequence per request")
         if seed is not None:
             torch.manual_seed(seed + self.rank)
             if torch.cuda.is_available():
@@ -267,7 +375,9 @@ class TransformersWorldModel:
                 temperature=self.config.generation.temperature,
                 top_p=self.config.generation.top_p,
             )
-        local_results: list[tuple[int, list[str]]] = []
+        if return_token_entropy:
+            generation_kwargs.update(return_dict_in_generate=True, output_logits=True)
+        local_results: list[tuple[int, list[str], float | None, int | None, bool | None]] = []
         micro_batch_size = self.config.generation.micro_batch_size
         try:
             for chunk_start in range(0, len(local), micro_batch_size):
@@ -281,11 +391,39 @@ class TransformersWorldModel:
                         "structured prompt packing exceeded the generation token budget"
                     )
                 with torch.inference_mode():
-                    generated = unwrapped.generate(**encoded, **generation_kwargs)
+                    generation_output = unwrapped.generate(**encoded, **generation_kwargs)
                 prompt_length = encoded["input_ids"].shape[1]
+                generated = (
+                    generation_output.sequences
+                    if return_token_entropy
+                    else generation_output
+                )
                 decoded = self.tokenizer.batch_decode(
                     generated[:, prompt_length:], skip_special_tokens=True
                 )
+                mean_entropies: list[float] | None = None
+                generated_token_counts: list[int] | None = None
+                hit_token_limits: list[bool] | None = None
+                if return_token_entropy:
+                    logits = generation_output.logits
+                    if not logits:
+                        raise RuntimeError("generation returned no token logits")
+                    generated_tokens = generated[
+                        :, prompt_length : prompt_length + len(logits)
+                    ]
+                    mean_entropies = mean_generated_token_entropy(
+                        logits,
+                        generated_tokens,
+                        eos_token_id=self.tokenizer.eos_token_id,
+                    ).tolist()
+                    valid_tokens, has_eos = valid_generated_token_mask(
+                        generated_tokens,
+                        eos_token_id=self.tokenizer.eos_token_id,
+                    )
+                    generated_token_counts = valid_tokens.sum(dim=1).tolist()
+                    hit_token_limits = (
+                        ~has_eos & (len(logits) >= self.config.generation.max_new_tokens)
+                    ).tolist()
                 for chunk_index, (global_index, _) in enumerate(chunk_local):
                     if global_index < 0:
                         continue
@@ -294,7 +432,16 @@ class TransformersWorldModel:
                         extract_observation(text)
                         for text in decoded[offset : offset + samples_per_request]
                     ]
-                    local_results.append((global_index, outcomes))
+                    entropy = None if mean_entropies is None else mean_entropies[offset]
+                    token_count = (
+                        None if generated_token_counts is None else generated_token_counts[offset]
+                    )
+                    hit_token_limit = (
+                        None if hit_token_limits is None else hit_token_limits[offset]
+                    )
+                    local_results.append(
+                        (global_index, outcomes, entropy, token_count, hit_token_limit)
+                    )
         finally:
             if self.config.model.gradient_checkpointing:
                 unwrapped.gradient_checkpointing_enable()
@@ -310,7 +457,30 @@ class TransformersWorldModel:
                 f"distributed generation lost requests: expected {len(requests)}, "
                 f"got {len(flattened)}"
             )
-        return [outcomes for _, outcomes in flattened]
+        predictions = [outcomes for _, outcomes, _, _, _ in flattened]
+        entropies = (
+            [float(entropy) for _, _, entropy, _, _ in flattened if entropy is not None]
+            if return_token_entropy
+            else None
+        )
+        if return_token_entropy and len(entropies or []) != len(predictions):
+            raise RuntimeError("distributed generation lost token entropy scores")
+        token_counts = (
+            [int(count) for _, _, _, count, _ in flattened if count is not None]
+            if return_token_entropy
+            else None
+        )
+        hit_token_limits = (
+            [bool(hit) for _, _, _, _, hit in flattened if hit is not None]
+            if return_token_entropy
+            else None
+        )
+        if return_token_entropy and (
+            len(token_counts or []) != len(predictions)
+            or len(hit_token_limits or []) != len(predictions)
+        ):
+            raise RuntimeError("distributed generation lost token-limit diagnostics")
+        return predictions, entropies, token_counts, hit_token_limits
 
     def _encode_training_example(self, experience: Experience) -> tuple[list[int], list[int]]:
         target_ids = self.tokenizer.encode(

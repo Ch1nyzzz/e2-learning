@@ -32,7 +32,7 @@ environment:
   max_candidate_actions: 0
 
 acquisition:
-  strategy: semantic_entropy
+  strategy: token_entropy
   uncertain_comparisons_are_distinct: true
   normalize_entropy: true
 
