@@ -171,7 +171,13 @@ class TransformersWorldModel:
             self.scheduler = scheduler
             self.accelerator.register_for_checkpointing(self.scheduler)
         else:
-            self.model = self.accelerator.prepare(model)
+            # Accelerate FSDP2 rebuilds parameter objects while sharding and therefore requires
+            # a model and optimizer to be prepared together, even for evaluation-only jobs. SGD
+            # has no state until a step occurs; it is used only to let Accelerate remap parameters
+            # and is discarded immediately after preparation.
+            preparation_optimizer = torch.optim.SGD(model.parameters(), lr=0.0)
+            self.model, _ = self.accelerator.prepare(model, preparation_optimizer)
+            self.model.eval()
             self.optimizer = None
             self.scheduler = None
             self.accelerator.register_for_checkpointing(_CheckpointStateSink())
