@@ -166,6 +166,10 @@ evaluation uses environment task completion directly and does not call the seman
 trajectories and adjacent `*.summary.json` files are written below
 `outputs/alfworld_qwen3_8b_parallel8/sr_eval/`.
 
+The two-A100 script evaluates 64 ALFWorld environments concurrently and uses a generation
+micro-batch of 32 per rank; these values are intentionally independent of the smaller online
+training batches.
+
 ## Local checks
 
 The tests do not download a language model or ALFWorld data:

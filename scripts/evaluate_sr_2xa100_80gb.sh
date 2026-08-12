@@ -15,6 +15,8 @@ run_evaluation() {
     --config_file configs/accelerate/fsdp_2xa100_80gb.yaml \
     -m experience_learning.cli evaluate-sr \
     --config "${config_path}" \
+    --set experiment.parallel_environments=64 \
+    --set generation.micro_batch_size=32 \
     --split "${split}" \
     --max-steps 30 \
     --report-step 20 \
