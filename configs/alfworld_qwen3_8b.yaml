@@ -10,7 +10,7 @@ model:
 
 generation:
   samples_per_action: 4
-  micro_batch_size: 4
+  micro_batch_size: 8
   max_new_tokens: 64
   temperature: 0.7
   top_p: 0.9
