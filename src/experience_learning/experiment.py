@@ -192,11 +192,23 @@ class OnlineExperienceExperiment:
         def operation() -> list[dict[str, Any]]:
             assert self.judge is not None
 
-            def execute(
-                job: tuple[int, EpisodeContext, str, str, int, int, dict[str, Any]],
+            # TextWorld's PDDL parser has process-global parser state and is not thread-safe.
+            # Environment transitions are cheap, so execute them serially and only parallelize
+            # the remote semantic-judge requests.
+            next_states = [
+                self.environments[job[0]].step(job[2])
+                for job in jobs
+            ]
+
+            def judge_transition(
+                item: tuple[
+                    tuple[int, EpisodeContext, str, str, int, int, dict[str, Any]],
+                    EnvironmentState,
+                ],
             ) -> dict[str, Any]:
+                job, next_state = item
                 (
-                    environment_index,
+                    _,
                     context,
                     action,
                     point_prediction,
@@ -204,7 +216,6 @@ class OnlineExperienceExperiment:
                     step,
                     acquisition,
                 ) = job
-                next_state = self.environments[environment_index].step(action)
                 verdict = self.judge.compare(
                     context=context,
                     action=action,
@@ -229,10 +240,11 @@ class OnlineExperienceExperiment:
                 }
 
             workers = min(self.config.judge.max_concurrency, len(jobs))
+            items = list(zip(jobs, next_states, strict=True))
             if workers <= 1:
-                return [execute(job) for job in jobs]
+                return [judge_transition(item) for item in items]
             with ThreadPoolExecutor(max_workers=workers) as executor:
-                return list(executor.map(execute, jobs))
+                return list(executor.map(judge_transition, items))
 
         return self._controller_packet(operation)
 
