@@ -24,7 +24,7 @@ training target.
 - token-entropy, semantic-sample-entropy, and random acquisition strategies
 - mistake-only and all-transition update gates for the 2x2 ablation
 - full-parameter Hugging Face training; LoRA/PEFT parameters are explicitly rejected
-- four-process Accelerate FSDP2 configuration for 4 x A100 80GB
+- Accelerate FSDP2 configurations for 2 or 4 x A100 80GB
 - sharded model/optimizer/scheduler/RNG checkpoints and complete JSONL transition logs
 
 Phase 1 evaluates world-model learning and interaction efficiency. Task-success claims need a
@@ -32,7 +32,7 @@ separately fixed planner, so they are deliberately not conflated with this first
 
 ## Vast.ai setup
 
-Use an Ubuntu image with four visible A100 80GB GPUs, enough system RAM for model loading, and a
+Use an Ubuntu image with two or four visible A100 80GB GPUs, enough system RAM for model loading, and a
 persistent volume. Python 3.11 is used because it is compatible with ALFWorld/TextWorld.
 
 ```bash
@@ -42,14 +42,16 @@ cp .env.example .env
 
 bash scripts/setup_vastai.sh
 set -a && source .env && set +a
-bash scripts/train_4xa100_80gb.sh
+# Choose the script matching the visible GPU count.
+bash scripts/train_2xa100_80gb.sh
+# bash scripts/train_4xa100_80gb.sh
 ```
 
 The provisional model is `Qwen/Qwen3-8B`, pinned to an immutable Hugging Face revision. Override
 both fields together if a different base model is chosen:
 
 ```bash
-bash scripts/train_4xa100_80gb.sh \
+bash scripts/train_2xa100_80gb.sh \
   --set model.name=YOUR_MODEL \
   --set model.revision=COMMIT_HASH \
   --set experiment.max_environment_steps=100
