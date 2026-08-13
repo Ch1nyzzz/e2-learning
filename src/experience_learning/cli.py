@@ -15,6 +15,43 @@ def _parser() -> argparse.ArgumentParser:
     train = subparsers.add_parser("train", help="run active ALFWorld experience learning")
     train.add_argument("--config", required=True)
     train.add_argument("--set", action="append", default=[], dest="overrides")
+    collect_rwml = subparsers.add_parser(
+        "collect-rwml-data", help="collect fixed on-policy ALFWorld transitions for RWML baselines"
+    )
+    collect_rwml.add_argument("--config", required=True)
+    collect_rwml.add_argument("--set", action="append", default=[], dest="overrides")
+    collect_rwml.add_argument("--tasks", type=int, default=2048)
+    collect_rwml.add_argument("--rollouts-per-task", type=int, default=3)
+    collect_rwml.add_argument("--parallel-environments", type=int, default=8)
+    collect_rwml.add_argument("--max-steps", type=int, default=30)
+    collect_rwml.add_argument("--max-action-tokens", type=int, default=512)
+    collect_rwml.add_argument("--output", required=True)
+    split_rwml = subparsers.add_parser(
+        "split-rwml-data", help="make a deterministic shared train/validation transition split"
+    )
+    split_rwml.add_argument("--config", required=True)
+    split_rwml.add_argument("--set", action="append", default=[], dest="overrides")
+    split_rwml.add_argument("--input", required=True)
+    split_rwml.add_argument("--train-output", required=True)
+    split_rwml.add_argument("--validation-output", required=True)
+    split_rwml.add_argument("--validation-fraction", type=float, default=0.1)
+    subset_rwml = subparsers.add_parser(
+        "subset-rwml-data", help="make a deterministic transition-count-matched subset"
+    )
+    subset_rwml.add_argument("--config", required=True)
+    subset_rwml.add_argument("--set", action="append", default=[], dest="overrides")
+    subset_rwml.add_argument("--input", required=True)
+    subset_rwml.add_argument("--output", required=True)
+    subset_rwml.add_argument("--records", type=int, required=True)
+    wm_sft = subparsers.add_parser(
+        "train-wm-sft", help="full-parameter offline WM SFT on a fixed transition corpus"
+    )
+    wm_sft.add_argument("--config", required=True)
+    wm_sft.add_argument("--set", action="append", default=[], dest="overrides")
+    wm_sft.add_argument("--train-data", required=True)
+    wm_sft.add_argument("--validation-data")
+    wm_sft.add_argument("--epochs", type=int, default=2)
+    wm_sft.add_argument("--effective-batch-size", type=int, default=32)
     validate = subparsers.add_parser("validate-config", help="resolve and validate configuration")
     validate.add_argument("--config", required=True)
     validate.add_argument("--set", action="append", default=[], dest="overrides")
@@ -80,6 +117,29 @@ def main(argv: Sequence[str] | None = None) -> int:
         )
         print(json.dumps(result, indent=2, sort_keys=True))
         return 0
+    if args.command == "split-rwml-data":
+        from experience_learning.offline import split_rwml_transitions
+
+        result = split_rwml_transitions(
+            input_path=args.input,
+            train_path=args.train_output,
+            validation_path=args.validation_output,
+            validation_fraction=args.validation_fraction,
+            seed=config.experiment.seed,
+        )
+        print(json.dumps(result, indent=2, sort_keys=True))
+        return 0
+    if args.command == "subset-rwml-data":
+        from experience_learning.offline import make_deterministic_subset
+
+        result = make_deterministic_subset(
+            input_path=args.input,
+            output_path=args.output,
+            records=args.records,
+            seed=config.experiment.seed,
+        )
+        print(json.dumps(result, indent=2, sort_keys=True))
+        return 0
 
     from experience_learning.distributed import broadcast_object
     from experience_learning.environment import ALFWorldTextEnvironment
@@ -89,8 +149,57 @@ def main(argv: Sequence[str] | None = None) -> int:
 
     if args.command in {"evaluate-probes", "evaluate-sr"} and args.checkpoint:
         config.training.resume_from = args.checkpoint
-    model = TransformersWorldModel(config, training=args.command == "train")
+    training_command = args.command in {"train", "train-wm-sft"}
+    model = TransformersWorldModel(config, training=training_command)
     is_main = model.accelerator.is_main_process
+    if args.command == "collect-rwml-data":
+        from experience_learning.offline import collect_rwml_transitions
+
+        def environment_factory(slot: int, stride: int) -> ALFWorldTextEnvironment:
+            env_config = EnvironmentConfig(**vars(config.environment))
+            env_config.split = "train"
+            env_config.max_steps_per_episode = args.max_steps
+            return ALFWorldTextEnvironment(
+                env_config,
+                config.experiment.seed + slot,
+                game_offset=slot,
+                game_stride=stride,
+            )
+
+        result = collect_rwml_transitions(
+            model=model,
+            environment_factory=environment_factory,
+            is_main_process=is_main,
+            tasks=args.tasks,
+            rollouts_per_task=args.rollouts_per_task,
+            parallelism=args.parallel_environments,
+            max_steps=args.max_steps,
+            max_action_tokens=args.max_action_tokens,
+            excluded_actions=config.environment.excluded_actions,
+            seed=config.experiment.seed,
+            output_path=args.output,
+        )
+        if is_main:
+            print(json.dumps(result, indent=2, sort_keys=True))
+        return 0
+    if args.command == "train-wm-sft":
+        from experience_learning.offline import train_offline_wm_sft
+
+        _write_resolved_config(config, config.experiment.output_dir)
+        result = train_offline_wm_sft(
+            model=model,
+            is_main_process=is_main,
+            train_path=args.train_data,
+            validation_path=args.validation_data,
+            output_dir=config.experiment.output_dir,
+            epochs=args.epochs,
+            effective_batch_size=args.effective_batch_size,
+            seed=config.experiment.seed,
+            evaluation_batch_size=config.evaluation.batch_size,
+        )
+        if is_main:
+            print(json.dumps(result, indent=2, sort_keys=True))
+        return 0
     if args.command == "evaluate-sr":
         from experience_learning.success_evaluation import evaluate_success_rate
 

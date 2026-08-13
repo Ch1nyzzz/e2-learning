@@ -14,6 +14,8 @@ from experience_learning.prompts import (
     extract_policy_action,
     policy_messages,
     prediction_messages,
+    rwml_wm_sft_prediction_messages,
+    rwml_wm_sft_training_target,
     training_target,
 )
 from experience_learning.types import (
@@ -237,7 +239,15 @@ class TransformersWorldModel:
         return 1.0
 
     def _chat_prompt(self, context: EpisodeContext, action: str) -> str:
-        messages = prediction_messages(context, action)
+        profile = getattr(
+            getattr(getattr(self, "config", None), "training", None),
+            "prompt_profile",
+            "default",
+        )
+        if profile == "rwml_wm_sft":
+            messages = rwml_wm_sft_prediction_messages(context, action)
+        else:
+            messages = prediction_messages(context, action)
         kwargs: dict[str, Any] = {"tokenize": False, "add_generation_prompt": True}
         try:
             return self.tokenizer.apply_chat_template(messages, enable_thinking=False, **kwargs)
@@ -657,8 +667,14 @@ class TransformersWorldModel:
         return predictions, entropies, token_counts, hit_token_limits
 
     def _encode_training_example(self, experience: Experience) -> tuple[list[int], list[int]]:
+        profile = getattr(self.config.training, "prompt_profile", "default")
+        target = (
+            rwml_wm_sft_training_target(experience.actual_observation)
+            if profile == "rwml_wm_sft"
+            else training_target(experience.actual_observation)
+        )
         target_ids = self.tokenizer.encode(
-            training_target(experience.actual_observation), add_special_tokens=False
+            target, add_special_tokens=False
         )
         reserved_target_tokens = len(target_ids) + int(self.tokenizer.eos_token_id is not None)
         prompt_budget = self.config.model.max_context_tokens - reserved_target_tokens
@@ -709,13 +725,16 @@ class TransformersWorldModel:
         self.model.train()
         self.optimizer.zero_grad(set_to_none=True)
         accumulated_loss = torch.zeros((), device=self.accelerator.device)
+        accumulated_target_tokens = torch.zeros((), device=self.accelerator.device)
         accumulation = self.config.training.gradient_accumulation_steps
         for index in range(accumulation):
             selected = [
                 experiences[(self.rank * accumulation + index + offset) % len(experiences)]
                 for offset in range(self.config.training.micro_batch_size)
             ]
-            output = self.model(**self._collate(selected), use_cache=False)
+            batch = self._collate(selected)
+            accumulated_target_tokens += (batch["labels"] != -100).sum()
+            output = self.model(**batch, use_cache=False)
             loss = output.loss / accumulation
             self.accelerator.backward(loss)
             accumulated_loss += loss.detach()
@@ -727,10 +746,14 @@ class TransformersWorldModel:
         self.optimizer.zero_grad(set_to_none=True)
         self._optimizer_step += 1
         mean_loss = self.accelerator.reduce(accumulated_loss, reduction="mean").item()
+        target_tokens = self.accelerator.reduce(
+            accumulated_target_tokens, reduction="sum"
+        ).item()
         return {
             "loss": float(mean_loss),
             "learning_rate": float(self.scheduler.get_last_lr()[0]),
             "optimizer_step": float(self._optimizer_step),
+            "target_tokens": float(target_tokens),
         }
 
     def score(self, experiences: Sequence[Experience]) -> dict[str, float]:

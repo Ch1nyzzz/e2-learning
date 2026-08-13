@@ -7,10 +7,12 @@ from experience_learning.model import (
     build_causal_training_sequence,
     mean_generated_token_entropy,
 )
-from experience_learning.types import EpisodeContext
+from experience_learning.types import EpisodeContext, Experience
 
 
 class WhitespaceTokenizer:
+    eos_token_id = None
+
     def apply_chat_template(self, messages, **_kwargs) -> str:
         return " ".join(f"{item['role']} {item['content']}" for item in messages)
 
@@ -76,3 +78,25 @@ def test_structured_prompt_packing_keeps_latest_state_and_action() -> None:
     assert "latest state" in prompt
     assert "open fridge" in prompt
     assert "world model" in prompt
+
+
+def test_rwml_wm_sft_profile_uses_empty_thinking_and_next_state_tags() -> None:
+    model = TransformersWorldModel.__new__(TransformersWorldModel)
+    model.tokenizer = WhitespaceTokenizer()
+    model.config = type(
+        "Config",
+        (),
+        {
+            "training": type("Training", (), {"prompt_profile": "rwml_wm_sft"})(),
+            "model": type("Model", (), {"max_context_tokens": 256})(),
+        },
+    )()
+    experience = Experience(EpisodeContext("start"), "open fridge", "", "opened", 0, 0)
+
+    input_ids, labels = model._encode_training_example(experience)
+    trained_tokens = [
+        token for token, label in zip(input_ids, labels, strict=True) if label != -100
+    ]
+
+    assert "<think>" in trained_tokens
+    assert any("<next_state>opened</next_state>" == token for token in trained_tokens)

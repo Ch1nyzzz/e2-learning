@@ -35,6 +35,12 @@ def test_token_entropy_is_the_default_acquisition() -> None:
     assert AppConfig().acquisition.strategy == "token_entropy"
 
 
+def test_rwml_wm_sft_prompt_profile_is_valid() -> None:
+    config = AppConfig()
+    config.training.prompt_profile = "rwml_wm_sft"
+    config.validate()
+
+
 def test_checkpoint_retention_cannot_be_negative() -> None:
     config = AppConfig()
     config.training.max_periodic_checkpoints_to_keep = -1

@@ -150,6 +150,49 @@ The summary reports conservative semantic accuracy (uncertain counts as incorrec
 accuracy upper bound, definite-decision accuracy, judge coverage, and target-observation token NLL.
 Retain the per-transition JSONL to audit judge errors.
 
+## RWML paper baseline: fixed offline WM SFT
+
+The RWML comparison is intentionally separate from this repository's online `random +
+all_transitions` condition. RWML first collects a fixed on-policy transition corpus and trains WM
+SFT and RWML on the same postprocessed data. The provided two-A100 workflow pins the paper's
+ALFWorld base model, `Qwen/Qwen2.5-7B-Instruct`, and follows its three rollouts per 2,048 training
+tasks, temperature 1.0, 30-step horizon, two SFT epochs, learning rate `2e-6`, and effective batch
+size 32:
+
+```bash
+export ALFWORLD_DATA=/workspace/data/alfworld
+bash scripts/collect_rwml_data_2xa100_80gb.sh
+bash scripts/train_rwml_wm_sft_2xa100_80gb.sh
+```
+
+The default collection script creates a deterministic 2,000-transition training subset for the
+interaction-budget-matched baseline:
+
+```bash
+RWML_SFT_EPOCHS=1 bash scripts/train_rwml_wm_sft_2xa100_80gb.sh \
+  data/rwml_alfworld_qwen25_7b_train_matched2000.jsonl \
+  data/rwml_alfworld_qwen25_7b_validation.jsonl \
+  --set experiment.output_dir=outputs/rwml_wm_sft_matched2000_s42
+```
+
+The 2,000-record one-epoch run is the default interaction-count-matched control. A 15,813-record
+paper-count-matched arm must be requested explicitly; because exact difficulty filtering is not
+implemented yet, even that count-matched arm is not a complete paper replication. Run summaries
+record dataset hashes, sample exposures, optimizer steps, and training target-token counts.
+
+Collection refuses to overwrite an existing dataset and writes a SHA-256 manifest. Each rollout
+pass recreates the sorted, strided ALFWorld environments so a task ID maps to the same game in all
+three passes. The split command removes invalid-action transitions and deterministically makes a
+90/10 train/validation split. WM SFT uses the paper's empty-reasoning target:
+`<think> </think><next_state>...</next_state>`.
+
+Important reproduction boundary: the generated split is a fixed shared **raw/postprocessed**
+corpus, not yet the paper's final 15,813-example difficulty-filtered corpus. Exact RWML filtering
+requires a separately SFT-trained filtering model, ten predictions per transition, and
+Qwen3-Embedding-8B thresholding. The split manifest labels this explicitly. Do not report the
+current result as the paper's filtered WM SFT until that stage is run. The same fixed raw corpus is
+intended to feed both that filtering stage and the forthcoming RWML-GRPO implementation.
+
 ## End-to-end ALFWorld success rate
 
 After training, run a single-seed paired comparison of the unchanged base model and final

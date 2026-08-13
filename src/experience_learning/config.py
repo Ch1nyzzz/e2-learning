@@ -76,6 +76,7 @@ class TrainingConfig:
     checkpoint_every_environment_steps: int = 100
     max_periodic_checkpoints_to_keep: int = 3
     resume_from: str | None = None
+    prompt_profile: str = "default"
 
 
 @dataclass
@@ -131,6 +132,8 @@ class AppConfig:
             raise ValueError("checkpoint retention cannot be negative")
         if self.training.update_gate not in {"mistake_only", "all_transitions"}:
             raise ValueError("update_gate must be mistake_only or all_transitions")
+        if self.training.prompt_profile not in {"default", "rwml_wm_sft"}:
+            raise ValueError("prompt_profile must be default or rwml_wm_sft")
         if self.acquisition.strategy not in {"token_entropy", "semantic_entropy", "random"}:
             raise ValueError(
                 "acquisition strategy must be token_entropy, semantic_entropy, or random"

@@ -1,0 +1,68 @@
+model:
+  name: Qwen/Qwen2.5-7B-Instruct
+  revision: a09a35458c702b33eeacc393d103063234e8bc28
+  trust_remote_code: false
+  attn_implementation: sdpa
+  max_context_tokens: 4096
+  dtype: bfloat16
+  gradient_checkpointing: true
+  distributed_timeout_seconds: 21600
+
+generation:
+  samples_per_action: 4
+  micro_batch_size: 8
+  max_new_tokens: 128
+  temperature: 1.0
+  top_p: 1.0
+
+judge:
+  provider: exact_match
+  model: ""
+  api_key_env: JUDGE_API_KEY
+  base_url: null
+  timeout_seconds: 60
+  max_retries: 3
+  max_concurrency: 1
+  cache_path: outputs/rwml_qwen25_7b/judge_cache.sqlite3
+
+environment:
+  config_path: configs/alfworld/base_config.yaml
+  split: train
+  max_steps_per_episode: 30
+  excluded_actions: []
+  max_candidate_actions: 0
+
+acquisition:
+  strategy: random
+  uncertain_comparisons_are_distinct: true
+  normalize_entropy: true
+
+training:
+  learning_rate: 2.0e-6
+  weight_decay: 0.0
+  adam_beta1: 0.9
+  adam_beta2: 0.95
+  max_grad_norm: 1.0
+  micro_batch_size: 1
+  gradient_accumulation_steps: 16
+  update_batch_size: 32
+  updates_per_mistake: 1
+  update_gate: all_transitions
+  warmup_updates: 0
+  checkpoint_every_environment_steps: 0
+  max_periodic_checkpoints_to_keep: 1
+  resume_from: null
+  prompt_profile: rwml_wm_sft
+
+experiment:
+  seed: 42
+  output_dir: outputs/rwml_wm_sft_qwen25_7b_s42
+  max_episodes: 2048
+  max_environment_steps: 100000
+  parallel_environments: 8
+  stop_error_rate_threshold: null
+  stop_error_rate_window: 200
+
+evaluation:
+  batch_size: 1
+  max_transitions: 0

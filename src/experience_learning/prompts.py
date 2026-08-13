@@ -15,6 +15,11 @@ the goal. Choose exactly one command from the supplied admissible actions. Brief
 <think>...</think>, then return the command verbatim inside <action>...</action>. Do not predict the
 next observation and do not return more than one action."""
 
+RWML_WM_SFT_SYSTEM_PROMPT = """You are an expert agent operating in the ALFRED Embodied
+Environment. Given the task interaction history and a potential action, predict the immediate next
+observation after executing that action. Directly present the prediction inside
+<next_state>...</next_state> tags. Do not generate anything else."""
+
 
 def render_transcript(context: EpisodeContext) -> str:
     parts = [f"INITIAL OBSERVATION:\n{context.initial_observation}"]
@@ -27,6 +32,27 @@ def prediction_messages(context: EpisodeContext, action: str) -> list[dict[str, 
     return [
         {"role": "system", "content": WORLD_MODEL_SYSTEM_PROMPT},
         {"role": "user", "content": f"{render_transcript(context)}\n\nPROPOSED ACTION:\n{action}"},
+    ]
+
+
+def rwml_wm_sft_prediction_messages(
+    context: EpisodeContext, action: str
+) -> list[dict[str, str]]:
+    current_observation = (
+        context.history[-1].observation if context.history else context.initial_observation
+    )
+    return [
+        {"role": "system", "content": RWML_WM_SFT_SYSTEM_PROMPT},
+        {
+            "role": "user",
+            "content": (
+                f"{render_transcript(context)}\n\n"
+                f"CURRENT OBSERVATION:\n"
+                f"{current_observation}"
+                f"\n\nPOTENTIAL ACTION:\n{action}\n\n"
+                "Predict the immediate next observation."
+            ),
+        },
     ]
 
 
@@ -48,6 +74,10 @@ def policy_messages(
 
 def training_target(observation: str) -> str:
     return f"<observation>{observation.strip()}</observation>"
+
+
+def rwml_wm_sft_training_target(observation: str) -> str:
+    return f"<think> </think>\n<next_state>{observation.strip()}</next_state>"
 
 
 def extract_observation(text: str) -> str:
