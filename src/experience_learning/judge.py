@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import logging
 import os
 import re
 import sqlite3
@@ -16,6 +17,8 @@ from experience_learning.types import EpisodeContext, JudgeResult, Verdict
 
 _WHITESPACE = re.compile(r"\s+")
 _PUNCTUATION = re.compile(r"[^a-z0-9 ]+")
+
+logger = logging.getLogger(__name__)
 
 
 def normalize_outcome(text: str) -> str:
@@ -89,6 +92,8 @@ class OpenAICompatibleSemanticJudge:
         self.model = config.model
         self.base_url = config.base_url or ""
         self.max_retries = config.max_retries
+        self.disable_reasoning = config.disable_reasoning
+        self.max_response_tokens = config.max_response_tokens
         self.cache = SQLiteJudgeCache(config.cache_path)
 
     def _cache_key(self, context: EpisodeContext, action: str, left: str, right: str) -> str:
@@ -167,27 +172,39 @@ class OpenAICompatibleSemanticJudge:
             '{"verdict":"EQUIVALENT|DIFFERENT|UNCERTAIN","confidence":0.0,'
             '"rationale":"short reason"}.'
         )
+        request_kwargs: dict[str, Any] = {
+            "model": self.model,
+            "messages": [
+                {"role": "system", "content": system},
+                {"role": "user", "content": json.dumps(payload, ensure_ascii=False)},
+            ],
+            "temperature": 0,
+            "max_tokens": self.max_response_tokens,
+            "response_format": {"type": "json_object"},
+        }
+        if self.disable_reasoning:
+            request_kwargs["extra_body"] = {"thinking": {"type": "disabled"}}
         last_error: Exception | None = None
         for attempt in range(self.max_retries):
             try:
-                response = self.client.chat.completions.create(
-                    model=self.model,
-                    messages=[
-                        {"role": "system", "content": system},
-                        {"role": "user", "content": json.dumps(payload, ensure_ascii=False)},
-                    ],
-                    temperature=0,
-                    response_format={"type": "json_object"},
-                )
+                response = self.client.chat.completions.create(**request_kwargs)
                 result = self._parse_response(response.choices[0].message.content or "")
                 self.cache.put(key, result)
                 return result
             except Exception as exc:
                 last_error = exc
+                logger.warning(
+                    "semantic judge attempt %d/%d failed: %s: %s",
+                    attempt + 1,
+                    self.max_retries,
+                    type(exc).__name__,
+                    exc,
+                )
                 if attempt + 1 < self.max_retries:
-                    time.sleep(min(8.0, 2.0**attempt))
+                    time.sleep(min(30.0, 2.0**attempt))
         raise RuntimeError(
-            f"semantic judge failed after {self.max_retries} attempts"
+            f"semantic judge failed after {self.max_retries} attempts; "
+            f"last error: {type(last_error).__name__}: {last_error}"
         ) from last_error
 
 

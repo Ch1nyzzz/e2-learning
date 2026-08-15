@@ -13,7 +13,7 @@ _ENV_PATTERN = re.compile(r"\$\{([A-Za-z_][A-Za-z0-9_]*)(?::-([^}]*))?}")
 
 @dataclass
 class ModelConfig:
-    name: str = "Qwen/Qwen3-8B"
+    name: str = "Qwen/Qwen2.5-7B-Instruct"
     revision: str | None = None
     trust_remote_code: bool = False
     attn_implementation: str = "sdpa"
@@ -41,6 +41,12 @@ class JudgeConfig:
     timeout_seconds: float = 60.0
     max_retries: int = 3
     max_concurrency: int = 1
+    # Send {"thinking": {"type": "disabled"}} so reasoning models skip the
+    # thinking phase; servers that do not know the field simply ignore it.
+    disable_reasoning: bool = True
+    # Verdict JSON is short; the cap keeps a runaway greedy decode from
+    # timing out deterministically on every retry.
+    max_response_tokens: int = 512
     cache_path: str = "outputs/judge_cache.sqlite3"
 
 
@@ -82,7 +88,7 @@ class TrainingConfig:
 @dataclass
 class ExperimentConfig:
     seed: int = 42
-    output_dir: str = "outputs/alfworld_qwen3_8b"
+    output_dir: str = "outputs/alfworld_qwen25_7b"
     max_episodes: int = 100
     max_environment_steps: int = 2000
     parallel_environments: int = 1
