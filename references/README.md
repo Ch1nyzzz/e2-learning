@@ -24,7 +24,7 @@ arXiv links below when sharing or citing a paper.
 
 The minimum matched comparison should include:
 
-1. Base Qwen3-8B ReAct.
+1. Base Qwen2.5-7B-Instruct ReAct.
 2. True next-observation SFT (current method).
 3. Shuffled-observation SFT with matched updates and token budget.
 4. Random acquisition instead of token-entropy acquisition.

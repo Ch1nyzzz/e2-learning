@@ -1,9 +1,9 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-config_path="${1:-configs/alfworld_qwen3_8b.yaml}"
-checkpoint_path="${2:-outputs/alfworld_qwen3_8b_parallel8/checkpoints/final}"
-output_root="${3:-outputs/alfworld_qwen3_8b_parallel8/sr_eval}"
+config_path="${1:-configs/alfworld_qwen25_7b.yaml}"
+checkpoint_path="${2:-outputs/alfworld_qwen25_7b_parallel8/checkpoints/final}"
+output_root="${3:-outputs/alfworld_qwen25_7b_parallel8/sr_eval}"
 
 mkdir -p "${output_root}"
 

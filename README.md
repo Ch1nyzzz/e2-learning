@@ -25,7 +25,7 @@ training target.
 - mistake-only and all-transition update gates for the 2x2 ablation
 - full-parameter Hugging Face training; LoRA/PEFT parameters are explicitly rejected
 - Accelerate FSDP2 configurations for 2 or 4 x A100 80GB
-- sharded model/optimizer/scheduler/RNG checkpoints and complete JSONL transition logs
+- compact Hugging Face safetensors model checkpoints and complete JSONL transition logs
 
 Phase 1 evaluates world-model learning and interaction efficiency. Task-success claims need a
 separately fixed planner, so they are deliberately not conflated with this first experiment.
@@ -47,8 +47,9 @@ bash scripts/train_2xa100_80gb.sh
 # bash scripts/train_4xa100_80gb.sh
 ```
 
-The provisional model is `Qwen/Qwen3-8B`, pinned to an immutable Hugging Face revision. Override
-both fields together if a different base model is chosen:
+All training arms use `Qwen/Qwen2.5-7B-Instruct`, pinned to the same immutable Hugging Face
+revision so their results remain directly comparable. Override both fields together if a different
+base model is chosen:
 
 ```bash
 bash scripts/train_2xa100_80gb.sh \
@@ -106,9 +107,14 @@ checkpoints/
   final/
 ```
 
-Periodic checkpoint retention defaults to the newest three checkpoints via
-`training.max_periodic_checkpoints_to_keep`; the final checkpoint is retained separately. Set the
-value to `0` only when unlimited periodic checkpoint history is intentional.
+
+Online checkpoints contain `config.json`, tokenizer files, sharded `model-*.safetensors`, and
+controller metadata. They intentionally omit optimizer, scheduler, and RNG state to keep each
+model artifact small; these HF exports are intended for evaluation and archival, while legacy
+The ALFWorld training configuration saves a periodic checkpoint every 1,000 environment steps and
+retains all periodic checkpoints (`training.max_periodic_checkpoints_to_keep: 0`); the final
+checkpoint is retained separately. Set a positive value only when bounded checkpoint history is
+intentional.
 
 Online collection can run synchronized environment waves with
 `experiment.parallel_environments`. Candidate predictions from every active environment are
@@ -124,12 +130,12 @@ environment transitions:
 
 ```bash
 uv run --extra alfworld experience-learning collect-probes \
-  --config configs/alfworld_qwen3_8b.yaml \
+  --config configs/alfworld_qwen25_7b.yaml \
   --split eval_in_distribution --episodes 50 \
   --output data/probes_valid_seen.jsonl
 
 uv run --extra alfworld experience-learning collect-probes \
-  --config configs/alfworld_qwen3_8b.yaml \
+  --config configs/alfworld_qwen25_7b.yaml \
   --split eval_out_of_distribution --episodes 50 \
   --output data/probes_valid_unseen.jsonl
 ```
@@ -140,10 +146,10 @@ Evaluate a sharded checkpoint with the same two-GPU launch configuration:
 uv run --extra train --extra alfworld accelerate launch \
   --config_file configs/accelerate/fsdp_2xa100_80gb.yaml \
   -m experience_learning.cli evaluate-probes \
-  --config configs/alfworld_qwen3_8b.yaml \
-  --checkpoint outputs/alfworld_qwen3_8b_parallel8/checkpoints/final \
+  --config configs/alfworld_qwen25_7b.yaml \
+  --checkpoint outputs/alfworld_qwen25_7b_parallel8/checkpoints/final \
   --probes data/probes_valid_unseen.jsonl \
-  --output outputs/alfworld_qwen3_8b_parallel8/eval_valid_unseen.jsonl
+  --output outputs/alfworld_qwen25_7b_parallel8/eval_valid_unseen.jsonl
 ```
 
 The summary reports conservative semantic accuracy (uncertain counts as incorrect), a semantic
@@ -207,7 +213,7 @@ Each rollout runs for at most 30 environment steps and the summary reports both 
 `SR@30`, invalid-action rate, mean successful trajectory length, and per-task-type success. This
 evaluation uses environment task completion directly and does not call the semantic judge. Raw
 trajectories and adjacent `*.summary.json` files are written below
-`outputs/alfworld_qwen3_8b_parallel8/sr_eval/`.
+`outputs/alfworld_qwen25_7b_parallel8/sr_eval/`.
 
 The two-A100 script evaluates 64 ALFWorld environments concurrently and uses a generation
 micro-batch of 32 per rank; these values are intentionally independent of the smaller online

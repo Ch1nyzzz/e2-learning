@@ -1,6 +1,6 @@
 model:
-  name: Qwen/Qwen2.5-7B-Instruct
-  revision: a09a35458c702b33eeacc393d103063234e8bc28
+  name: Qwen/Qwen3-8B
+  revision: b968826d9c46dd6066d109eabc6255188de91218
   trust_remote_code: false
   attn_implementation: sdpa
   max_context_tokens: 4096
@@ -24,7 +24,7 @@ judge:
   max_retries: 8
   max_concurrency: 8
   disable_reasoning: true
-  cache_path: outputs/alfworld_qwen25_7b_parallel8/judge_cache.sqlite3
+  cache_path: outputs/alfworld_qwen3_8b_parallel8/judge_cache.sqlite3
 
 environment:
   config_path: configs/alfworld/base_config.yaml
@@ -59,7 +59,7 @@ training:
 
 experiment:
   seed: 42
-  output_dir: outputs/alfworld_qwen25_7b_parallel8
+  output_dir: outputs/alfworld_qwen3_8b_parallel8
   max_episodes: 100
   max_environment_steps: 2000
   parallel_environments: 8

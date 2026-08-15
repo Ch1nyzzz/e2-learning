@@ -52,6 +52,14 @@ def _load_model_only_accelerator_state(accelerator: Any, checkpoint: str) -> Non
         accelerator._optimizers = optimizers
 
 
+def _is_hf_checkpoint(path: str | Path) -> bool:
+    """Return whether ``path`` contains a loadable Hugging Face model export."""
+    checkpoint = Path(path)
+    if not checkpoint.is_dir() or not (checkpoint / "config.json").is_file():
+        return False
+    return any(checkpoint.glob("*.safetensors")) or any(checkpoint.glob("*.bin"))
+
+
 def valid_generated_token_mask(
     generated_tokens: Any,
     *,
@@ -145,6 +153,16 @@ class TransformersWorldModel:
         self.world_size = self.accelerator.num_processes
         self.training_enabled = training
         self._optimizer_step = 0
+        resume_path = (
+            Path(config.training.resume_from) if config.training.resume_from else None
+        )
+        hf_checkpoint = resume_path is not None and _is_hf_checkpoint(resume_path)
+        if hf_checkpoint and training:
+            raise ValueError(
+                "HF-only checkpoints contain model weights but no optimizer state; "
+                "use them for evaluation or start a new training output directory"
+            )
+        model_source = str(resume_path) if hf_checkpoint else config.model.name
         dtype = {
             "bfloat16": torch.bfloat16,
             "float16": torch.float16,
@@ -156,9 +174,9 @@ class TransformersWorldModel:
         common_kwargs: dict[str, Any] = {
             "trust_remote_code": config.model.trust_remote_code,
         }
-        if config.model.revision:
+        if config.model.revision and not hf_checkpoint:
             common_kwargs["revision"] = config.model.revision
-        self.tokenizer = AutoTokenizer.from_pretrained(config.model.name, **common_kwargs)
+        self.tokenizer = AutoTokenizer.from_pretrained(model_source, **common_kwargs)
         if self.tokenizer.pad_token_id is None:
             self.tokenizer.pad_token = self.tokenizer.eos_token
 
@@ -169,7 +187,7 @@ class TransformersWorldModel:
         }
         if config.model.attn_implementation:
             model_kwargs["attn_implementation"] = config.model.attn_implementation
-        model = AutoModelForCausalLM.from_pretrained(config.model.name, **model_kwargs)
+        model = AutoModelForCausalLM.from_pretrained(model_source, **model_kwargs)
         model.config.use_cache = False
         if config.model.gradient_checkpointing:
             model.gradient_checkpointing_enable()
@@ -210,7 +228,7 @@ class TransformersWorldModel:
             self.optimizer = None
             self.scheduler = None
             self.accelerator.register_for_checkpointing(_CheckpointStateSink())
-        if config.training.resume_from:
+        if config.training.resume_from and not hf_checkpoint:
             if training:
                 self.accelerator.load_state(config.training.resume_from)
             else:
@@ -780,7 +798,19 @@ class TransformersWorldModel:
         output = Path(output_dir)
         output.mkdir(parents=True, exist_ok=True)
         self.accelerator.wait_for_everyone()
-        self.accelerator.save_state(str(output))
+        # Save only a standard HF safetensors export. The old accelerator.save_state path also
+        # copied AdamW, scheduler, RNG, and FSDP optimizer shards for every checkpoint, which is
+        # unnecessary for model artifacts and multiplies disk usage.
+        self.accelerator.save_model(
+            self.model,
+            str(output),
+            max_shard_size="5GB",
+            safe_serialization=True,
+        )
         if self.accelerator.is_main_process:
-            self.tokenizer.save_pretrained(output / "tokenizer")
+            model_to_save = self.accelerator.unwrap_model(self.model)
+            model_to_save.config.save_pretrained(output)
+            if getattr(model_to_save, "generation_config", None) is not None:
+                model_to_save.generation_config.save_pretrained(output)
+            self.tokenizer.save_pretrained(output)
         self.accelerator.wait_for_everyone()

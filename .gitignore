@@ -17,3 +17,6 @@ data/
 
 # Local ChatGPT project-mirror instruction file; not part of the research repository.
 /AGENTS.md
+
+# experiment launch/monitor logs
+runs/
