@@ -30,6 +30,9 @@ class GenerationConfig:
     max_new_tokens: int = 128
     temperature: float = 0.7
     top_p: float = 0.9
+    # Chat-template thinking switch for the policy/SR-eval path (models whose
+    # template lacks the kwarg ignore it via the TypeError fallback).
+    policy_enable_thinking: bool = True
 
 
 @dataclass

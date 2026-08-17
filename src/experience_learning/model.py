@@ -338,7 +338,9 @@ class TransformersWorldModel:
             kwargs: dict[str, Any] = {"tokenize": False, "add_generation_prompt": True}
             try:
                 prompt = self.tokenizer.apply_chat_template(
-                    messages, enable_thinking=True, **kwargs
+                    messages,
+                    enable_thinking=self.config.generation.policy_enable_thinking,
+                    **kwargs,
                 )
             except TypeError:
                 prompt = self.tokenizer.apply_chat_template(messages, **kwargs)

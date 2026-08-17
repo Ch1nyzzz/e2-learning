@@ -20,6 +20,17 @@ Environment. Given the task interaction history and a potential action, predict 
 observation after executing that action. Directly present the prediction inside
 <next_state>...</next_state> tags. Do not generate anything else."""
 
+# RWML GRPO variant (paper Table A4): unlike WM SFT, the model must reason inside
+# <think>...</think> before the <next_state> prediction that the reward compares.
+RWML_GRPO_SYSTEM_PROMPT = """You are an expert agent operating in the ALFRED Embodied
+Environment. Given the task interaction history and a potential action, predict the immediate next
+observation after taking that action. You should first briefly reason step-by-step about the
+previous steps and current situation -- summarize key information you've learned about the
+environment that is relevant to the task. This reflection and reasoning process must be enclosed
+within <think> </think> tags. Once you've finished your reasoning, you should describe the next
+observation (use the past and current observations as examples!) and present them within
+<next_state> </next_state> tags."""
+
 
 def render_transcript(context: EpisodeContext) -> str:
     parts = [f"INITIAL OBSERVATION:\n{context.initial_observation}"]
@@ -54,6 +65,38 @@ def rwml_wm_sft_prediction_messages(
             ),
         },
     ]
+
+
+def rwml_grpo_prediction_messages(context: EpisodeContext, action: str) -> list[dict[str, str]]:
+    current_observation = (
+        context.history[-1].observation if context.history else context.initial_observation
+    )
+    return [
+        {"role": "system", "content": RWML_GRPO_SYSTEM_PROMPT},
+        {
+            "role": "user",
+            "content": (
+                f"{render_transcript(context)}\n\n"
+                f"CURRENT OBSERVATION:\n"
+                f"{current_observation}"
+                f"\n\nPOTENTIAL ACTION:\n{action}\n\n"
+                "Reason inside <think> </think>, then predict the immediate next observation "
+                "inside <next_state> </next_state>."
+            ),
+        },
+    ]
+
+
+def extract_next_state(text: str) -> str | None:
+    """Pull the <next_state> payload from a WM SFT or RWML generation; None if absent."""
+    cleaned = text.strip()
+    open_tag = cleaned.rfind("<next_state>")
+    if open_tag < 0:
+        return None
+    close_tag = cleaned.find("</next_state>", open_tag + len("<next_state>"))
+    if close_tag < 0:
+        return None
+    return cleaned[open_tag + len("<next_state>") : close_tag].strip()
 
 
 def policy_messages(
