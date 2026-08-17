@@ -6,6 +6,7 @@ set -euo pipefail
 MODEL_PATH=${MODEL_PATH:?Set MODEL_PATH to a Hugging Face model id or local HF checkpoint}
 EXPERIMENT_NAME=${EXPERIMENT_NAME:?Set EXPERIMENT_NAME}
 TOKENIZER_PATH=${TOKENIZER_PATH:-$MODEL_PATH}
+VERL_PYTHON=${VERL_PYTHON:-.venv/bin/python}
 VERL_AGENT_DIR=${VERL_AGENT_DIR:-/workspace/verl-agent}
 ALFWORLD_DATA=${ALFWORLD_DATA:-/workspace/data/alfworld}
 TRAIN_STEPS=${TRAIN_STEPS:-300}
@@ -23,17 +24,17 @@ export VLLM_ATTENTION_BACKEND=${VLLM_ATTENTION_BACKEND:-FLASH_ATTN}
 
 cd "$VERL_AGENT_DIR"
 
-.venv/bin/python -m examples.data_preprocess.prepare \
+"$VERL_PYTHON" -m examples.data_preprocess.prepare \
   --mode text \
   --train_data_size "$TRAIN_TASKS_PER_UPDATE" \
   --val_data_size "$VAL_TASKS"
 
-.venv/bin/python -m verl.trainer.main_ppo \
+"$VERL_PYTHON" -m verl.trainer.main_ppo \
   algorithm.adv_estimator=grpo \
   algorithm.gamma=1.0 \
   algorithm.use_kl_in_reward=False \
-  data.train_files="$HOME/data/verl-agent/text/train.parquet" \
-  data.val_files="$HOME/data/verl-agent/text/test.parquet" \
+  data.train_files="${VERL_DATA_DIR:-$HOME/data/verl-agent}/text/train.parquet" \
+  data.val_files="${VERL_DATA_DIR:-$HOME/data/verl-agent}/text/test.parquet" \
   data.train_batch_size="$TRAIN_TASKS_PER_UPDATE" \
   data.val_batch_size="$VAL_TASKS" \
   data.max_prompt_length=2048 \
@@ -92,6 +93,6 @@ cd "$VERL_AGENT_DIR"
   trainer.total_training_steps="$TRAIN_STEPS" \
   trainer.val_before_train=False \
   trainer.max_actor_ckpt_to_keep=2 \
-  trainer.default_local_dir="/workspace/checkpoints/e2l_policy_grpo/$EXPERIMENT_NAME" \
+  trainer.default_local_dir="${CKPT_ROOT:-/workspace/checkpoints/e2l_policy_grpo}/$EXPERIMENT_NAME" \
   ray_init.num_cpus=64 \
   "$@"

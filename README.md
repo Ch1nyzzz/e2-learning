@@ -47,6 +47,12 @@ bash scripts/train_2xa100_80gb.sh
 # bash scripts/train_4xa100_80gb.sh
 ```
 
+## Remote 8xA100 handoff
+
+Migrating the Stage-2 GRPO training to another 8xA100 machine (Docker image,
+model/data pull, launch commands): see `docs/playbook.md` and
+`docs/handoff_experiments.md`.
+
 All training arms use `Qwen/Qwen2.5-7B-Instruct`, pinned to the same immutable Hugging Face
 revision so their results remain directly comparable. Override both fields together if a different
 base model is chosen:

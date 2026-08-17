@@ -32,12 +32,30 @@ set -euo pipefail
 #   MODEL_PATH=Qwen/Qwen3-8B EXPERIMENT_NAME=q3_stage2_plain \
 #     USE_FUTILE_PENALTY=false STAGE2_PROMPT=true \
 #     bash scripts/train_policy_grpo_stage2.sh
+#
+# 8x A100 80GB single node: set GPUS=0,1,2,3,4,5,6,7 and use the 8-GPU
+# overrides below, which track verl-agent's official ALFWorld GRPO recipe and
+# other 8-GPU ALFWorld GRPO releases (EP-R1, CoEvoSkill; see
+# docs/handoff_experiments.md):
+#   ROLLOUT_TP=1 GPU_MEM_UTIL=0.6 FSDP_PARAM_OFFLOAD=false \
+#   FSDP_OPTIMIZER_OFFLOAD=false ENFORCE_EAGER=false FREE_CACHE_ENGINE=false
+# Keep TRAIN_TASKS_PER_UPDATE=16 x GROUP_SIZE=8 (128 trajectories/update): that
+# is the paper-standard update size and preserves comparability across arms --
+# 8 GPUs buy wall-clock speed, not a larger batch.
+REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 MODEL_PATH=${MODEL_PATH:?Set MODEL_PATH (cold-start HF checkpoint or base model)}
 EXPERIMENT_NAME=${EXPERIMENT_NAME:?Set EXPERIMENT_NAME}
 TOKENIZER_PATH=${TOKENIZER_PATH:-$MODEL_PATH}
-VERL_AGENT_DIR=${VERL_AGENT_DIR:-/home/yuhan/verl-agent}
-ALFWORLD_DATA=${ALFWORLD_DATA:-/home/yuhan/.cache/alfworld}
-CKPT_ROOT=${CKPT_ROOT:-/helios-storage/helios4-data/yuhan/e2l_policy_grpo}
+# Machine-specific locations; all overridable, defaults follow common
+# conventions ($HOME-based) rather than any particular host.
+VERL_AGENT_DIR=${VERL_AGENT_DIR:-$HOME/verl-agent}
+ALFWORLD_DATA=${ALFWORLD_DATA:-$HOME/.cache/alfworld}
+CKPT_ROOT=${CKPT_ROOT:-$REPO_ROOT/checkpoints/e2l_policy_grpo}
+# Where verl-agent's data_preprocess.prepare writes/reads the text parquet.
+VERL_DATA_DIR=${VERL_DATA_DIR:-$HOME/data/verl-agent}
+# Interpreter for verl-agent commands: the checkout's .venv locally; container
+# images set VERL_PYTHON to their system interpreter instead.
+VERL_PYTHON=${VERL_PYTHON:-.venv/bin/python}
 # No default on purpose: a reflexive launch must not land on GPUs a live run
 # already owns (e.g. the stage-1 baseline on 0,1,2). Check nvidia-smi first.
 GPUS=${GPUS:?Set GPUS explicitly, e.g. GPUS=0,1,2,3 (check nvidia-smi for free devices)}
@@ -85,7 +103,7 @@ export VLLM_ATTENTION_BACKEND=${VLLM_ATTENTION_BACKEND:-FLASH_ATTN}
 # Another user keeps a long-lived Ray cluster registered under /tmp/ray; force
 # an isolated local instance so we neither join nor clobber it.
 export RAY_ADDRESS=local
-export RAY_TMPDIR=/tmp/ray_yuhan_e2l
+export RAY_TMPDIR=${RAY_TMPDIR:-/tmp/ray_e2l_$USER}
 # Both local disks sit above Ray's default 95% disk-usage alarm; text-only
 # rollouts never spill the object store, so raise the threshold to stop the
 # raylet warning spam that otherwise floods the training log every 10s.
@@ -93,17 +111,17 @@ export RAY_local_fs_capacity_threshold=0.995
 
 cd "$VERL_AGENT_DIR"
 
-.venv/bin/python -m examples.data_preprocess.prepare \
+"$VERL_PYTHON" -m examples.data_preprocess.prepare \
   --mode text \
   --train_data_size "$TRAIN_TASKS_PER_UPDATE" \
   --val_data_size "$VAL_TASKS"
 
-.venv/bin/python -m verl.trainer.main_ppo \
+"$VERL_PYTHON" -m verl.trainer.main_ppo \
   algorithm.adv_estimator=grpo \
   algorithm.gamma=1.0 \
   algorithm.use_kl_in_reward=False \
-  data.train_files="$HOME/data/verl-agent/text/train.parquet" \
-  data.val_files="$HOME/data/verl-agent/text/test.parquet" \
+  data.train_files="$VERL_DATA_DIR/text/train.parquet" \
+  data.val_files="$VERL_DATA_DIR/text/test.parquet" \
   data.train_batch_size="$TRAIN_TASKS_PER_UPDATE" \
   data.val_batch_size="$VAL_TASKS" \
   data.max_prompt_length="$MAX_PROMPT_LENGTH" \
@@ -126,8 +144,8 @@ cd "$VERL_AGENT_DIR"
   actor_rollout_ref.actor.use_kl_loss=True \
   actor_rollout_ref.actor.kl_loss_coef=0.01 \
   actor_rollout_ref.actor.kl_loss_type=low_var_kl \
-  actor_rollout_ref.actor.fsdp_config.param_offload=True \
-  actor_rollout_ref.actor.fsdp_config.optimizer_offload=True \
+  actor_rollout_ref.actor.fsdp_config.param_offload=${FSDP_PARAM_OFFLOAD:-true} \
+  actor_rollout_ref.actor.fsdp_config.optimizer_offload=${FSDP_OPTIMIZER_OFFLOAD:-true} \
   actor_rollout_ref.rollout.log_prob_use_dynamic_bsz=True \
   actor_rollout_ref.rollout.log_prob_micro_batch_size_per_gpu=1 \
   actor_rollout_ref.rollout.log_prob_max_token_len_per_gpu="$LOGPROB_MAX_TOKEN_LEN" \
@@ -135,14 +153,14 @@ cd "$VERL_AGENT_DIR"
   actor_rollout_ref.rollout.name=vllm \
   actor_rollout_ref.rollout.gpu_memory_utilization=${GPU_MEM_UTIL:-0.35} \
   actor_rollout_ref.rollout.enable_chunked_prefill=False \
-  actor_rollout_ref.rollout.enforce_eager=True \
-  actor_rollout_ref.rollout.free_cache_engine=True \
+  actor_rollout_ref.rollout.enforce_eager=${ENFORCE_EAGER:-true} \
+  actor_rollout_ref.rollout.free_cache_engine=${FREE_CACHE_ENGINE:-true} \
   actor_rollout_ref.rollout.val_kwargs.temperature=0.4 \
   actor_rollout_ref.rollout.val_kwargs.do_sample=True \
   actor_rollout_ref.ref.log_prob_use_dynamic_bsz=True \
   actor_rollout_ref.ref.log_prob_micro_batch_size_per_gpu=1 \
   actor_rollout_ref.ref.log_prob_max_token_len_per_gpu="$LOGPROB_MAX_TOKEN_LEN" \
-  actor_rollout_ref.ref.fsdp_config.param_offload=True \
+  actor_rollout_ref.ref.fsdp_config.param_offload=${REF_PARAM_OFFLOAD:-true} \
   actor_rollout_ref.actor.use_invalid_action_penalty=True \
   actor_rollout_ref.actor.invalid_action_penalty_coef=0.1 \
   actor_rollout_ref.actor.use_futile_penalty="$USE_FUTILE_PENALTY" \
@@ -170,5 +188,5 @@ cd "$VERL_AGENT_DIR"
   trainer.val_before_train=True \
   trainer.max_actor_ckpt_to_keep=1 \
   trainer.default_local_dir="$CKPT_ROOT/$EXPERIMENT_NAME" \
-  ray_init.num_cpus=96 \
+  ray_init.num_cpus=${RAY_NUM_CPUS:-96} \
   "$@"

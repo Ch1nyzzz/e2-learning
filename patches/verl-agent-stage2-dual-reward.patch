@@ -1,0 +1,990 @@
+From 559f9bdf173dfa0c289e5b8c906c2fa44cf6e4c2 Mon Sep 17 00:00:00 2001
+From: Ch1nyzzz <erv1n_chen@outlook.com>
+Date: Mon, 17 Aug 2026 15:46:03 -0400
+Subject: [PATCH] Add Stage 2 dual-reward GRPO: futile-repetition penalty for
+ ALFWorld
+
+Entity-slice futile detection (FutileTracker) over TextWorld facts with
+post-execution snapshots, epistemic-predicate-tolerant no-op checks, and
+agent-position slices; per-trajectory futile_weighted threaded through the
+multi-turn rollout mirroring the invalid-action pathway; trainer-side
+apply_futile_penalty with success-rate-EMA annealed coefficient (persisted
+across resumes); gated stage2 prompt template and history-review sentence.
+All behavior is off by default (use_futile_penalty / stage2_prompt False);
+the only always-on change is requesting facts=True, consumed and dropped
+inside the env worker. Ray-free CPU integration test covers the five
+canonical futile/exempt patterns.
+
+Co-Authored-By: Claude Fable 5 <noreply@anthropic.com>
+---
+ agent_system/environments/env_manager.py      |  10 +-
+ .../agents/environment/alfred_tw_env.py       |   6 +-
+ .../environments/env_package/alfworld/envs.py |  29 +-
+ .../env_package/alfworld/futile_tracker.py    | 189 +++++++++++
+ agent_system/environments/prompts/alfworld.py |  20 +-
+ .../multi_turn_rollout/rollout_loop.py        |  49 ++-
+ tests_stage2/test_futile_tracker_cpu.py       | 320 ++++++++++++++++++
+ verl/trainer/config/ppo_trainer.yaml          |   5 +
+ verl/trainer/ppo/ray_trainer.py               |  85 +++++
+ 9 files changed, 699 insertions(+), 14 deletions(-)
+ create mode 100644 agent_system/environments/env_package/alfworld/futile_tracker.py
+ create mode 100644 tests_stage2/test_futile_tracker_cpu.py
+
+diff --git a/agent_system/environments/env_manager.py b/agent_system/environments/env_manager.py
+index ab09dff..2256c9a 100644
+--- a/agent_system/environments/env_manager.py
++++ b/agent_system/environments/env_manager.py
+@@ -182,23 +182,27 @@ class AlfWorldEnvironmentManager(EnvironmentManagerBase):
+         This function builds the text observation for the agent.
+         """
+         postprocess_text_obs = []
++        # stage2_prompt may be absent from older configs; .get keeps default behavior
++        use_stage2 = bool(self.config.env.get('stage2_prompt', False))
++        template_no_his = ALFWORLD_TEMPLATE_NO_HIS_STAGE2 if use_stage2 else ALFWORLD_TEMPLATE_NO_HIS
++        template = ALFWORLD_TEMPLATE_STAGE2 if use_stage2 else ALFWORLD_TEMPLATE
+         if not init and self.config.env.history_length > 0:
+             memory_contexts, valid_lens = self.memory.fetch(
+                     self.config.env.history_length,
+                     obs_key="text_obs",
+                     action_key="action")
+-            
++
+         for i in range(len(text_obs)):
+             # exclude 'help' in admissible_actions[i]
+             reformatted_admissible_actions = "\n ".join(f"'{s}'" for s in admissible_actions[i] if s != 'help')
+ 
+             if init or self.config.env.history_length <= 0:
+-                obs = ALFWORLD_TEMPLATE_NO_HIS.format(
++                obs = template_no_his.format(
+                     current_observation=text_obs[i],
+                     admissible_actions=reformatted_admissible_actions
+                 )
+             else:
+-                obs = ALFWORLD_TEMPLATE.format(
++                obs = template.format(
+                     task_description=self.tasks[i],
+                     step_count=len(self.memory[i]),
+                     history_length=valid_lens[i],
+diff --git a/agent_system/environments/env_package/alfworld/alfworld/agents/environment/alfred_tw_env.py b/agent_system/environments/env_package/alfworld/alfworld/agents/environment/alfred_tw_env.py
+index 72ada5f..538c790 100644
+--- a/agent_system/environments/env_package/alfworld/alfworld/agents/environment/alfred_tw_env.py
++++ b/agent_system/environments/env_package/alfworld/alfworld/agents/environment/alfred_tw_env.py
+@@ -251,7 +251,11 @@ class AlfredTWEnv(object):
+         wrappers = [alfred_demangler, AlfredInfos]
+ 
+         # Register a new Gym environment.
+-        request_infos = textworld.EnvInfos(won=True, admissible_commands=True, extras=["gamefile"])
++        # facts=True exposes the symbolic state for futile-repetition tracking.
++        # PddlEnv renders facts with entity_infos[id].name, which the
++        # AlfredDemangler wrapper rewrites to 'cabinet 1'-style names, so fact
++        # arguments already match action-text entity names.
++        request_infos = textworld.EnvInfos(won=True, admissible_commands=True, facts=True, extras=["gamefile"])
+         expert_type = self.config["env"]["expert_type"]
+         training_method = self.config["general"]["training_method"]
+ 
+diff --git a/agent_system/environments/env_package/alfworld/envs.py b/agent_system/environments/env_package/alfworld/envs.py
+index e72f621..a4f8a81 100644
+--- a/agent_system/environments/env_package/alfworld/envs.py
++++ b/agent_system/environments/env_package/alfworld/envs.py
+@@ -23,6 +23,7 @@ import torchvision.transforms as T
+ import ray
+ 
+ from agent_system.environments.env_package.alfworld.alfworld.agents.environment import get_environment
++from agent_system.environments.env_package.alfworld.futile_tracker import FutileTracker
+ 
+ ALF_ACTION_LIST=["pass", "goto", "pick", "put", "open", "close", "toggle", "heat", "clean", "cool", "slice", "inventory", "examine", "look"]
+ # ALF_ITEM_LIST =
+@@ -61,19 +62,39 @@ class AlfworldWorker:
+     def __init__(self, config, seed, base_env):
+         self.env = base_env.init_env(batch_size=1)  # Each worker holds only one sub-environment
+         self.env.seed(seed)
+-    
++        self.futile_tracker = FutileTracker()
++        self._last_facts = None
++
+     def step(self, action):
+         """Execute a step in the environment"""
+-        actions = [action] 
+-        
++        actions = [action]
++
++        pre_facts = self._last_facts
++        # FutileTracker degrades to (False, 0) internally on any error, so it
++        # can never crash the worker even if facts are missing at runtime.
++        futile, futile_streak = self.futile_tracker.pre_step(action, pre_facts)
+         obs, scores, dones, infos = self.env.step(actions)
++        post_facts = infos.get('facts', [None])[0]
++        self.futile_tracker.post_step(action, obs[0], pre_facts, post_facts)
++        self._last_facts = post_facts
++        # facts are only consumed by the tracker inside this worker; drop them
++        # so hundreds of Propositions per step never cross the Ray boundary or
++        # accumulate in the driver's per-step info lists.
++        infos.pop('facts', None)
+         infos['observation_text'] = obs
++        infos['futile'] = [futile]
++        infos['futile_streak'] = [futile_streak]
+         return obs, scores, dones, infos
+-    
++
+     def reset(self):
+         """Reset the environment"""
+         obs, infos = self.env.reset()
++        self.futile_tracker.reset()
++        self._last_facts = infos.get('facts', [None])[0]
++        infos.pop('facts', None)  # worker-internal, see step()
+         infos['observation_text'] = obs
++        infos['futile'] = [False]
++        infos['futile_streak'] = [0]
+         return obs, infos
+     
+     def getobs(self):
+diff --git a/agent_system/environments/env_package/alfworld/futile_tracker.py b/agent_system/environments/env_package/alfworld/futile_tracker.py
+new file mode 100644
+index 0000000..502891a
+--- /dev/null
++++ b/agent_system/environments/env_package/alfworld/futile_tracker.py
+@@ -0,0 +1,189 @@
++# Copyright 2025 Nanyang Technological University (NTU), Singapore
++# and the verl-agent (GiGPO) team.
++#
++# Licensed under the Apache License, Version 2.0 (the "License");
++# you may not use this file except in compliance with the License.
++# You may obtain a copy of the License at
++#
++#     http://www.apache.org/licenses/LICENSE-2.0
++#
++# Unless required by applicable law or agreed to in writing, software
++# distributed under the License is distributed on an "AS IS" BASIS,
++# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++# See the License for the specific language governing permissions and
++# limitations under the License.
++"""Per-episode "futile repetition" detector for the ALFWorld TextWorld env.
++
++An executed action a is FUTILE at step t iff:
++  1. a (normalized string) was executed before in this episode at some t' < t;
++  2. that execution at t' was a state no-op (see _is_noop);
++  3. the entity slice of a, snapshotted AFTER the execution at t' (post-state),
++     equals the entity slice of a at decision time t.
++First-time mistakes are never penalized; a repeat is exempt as soon as the
++action's entity slice (or the inventory, or the agent's position) has changed
++since the failed attempt.
++
++Facts arrive already demangled: PddlEnv._get_human_readable_fact maps every
++fact argument id through entity_infos[id].name, and AlfredDemangler rewrites
++those names to 'cabinet 1'-style strings at load time. So action-text entity
++names match fact argument names directly (modulo the trailing space that
++demangling leaves on unnumbered entities like 'agent1 ' / 'loc 3' -> we strip).
++"""
++
++import re
++
++
++class FutileTracker:
++    """Tracks futile repetitions within one episode of one env instance.
++
++    Usage (around env.step):
++        futile, streak = tracker.pre_step(action, facts_before_step)
++        obs, ... = env.step(action)
++        tracker.post_step(action, feedback, facts_before_step, facts_after_step)
++    """
++
++    # Epistemic markers (from the alfred.pddl predicate list): 'checked' is
++    # added by examine/inventory/open, 'examined' is declared for locations.
++    # A diff containing ONLY these is knowledge-gain, not a world-state change,
++    # but strict facts-equality would misclassify e.g. the first examine.
++    # The 'not_' variants are the negated forms textworld emits for deletes.
++    EPISTEMIC_PREDICATES = frozenset(
++        {"checked", "examined", "not_checked", "not_examined"})
++
++    # Facts describing what the agent holds (verified empirically: take adds
++    # holds/holdsany, put adds not_holds/not_holdsany; the domain also declares
++    # holdsAnyReceptacleObject). Always unioned into every entity slice so an
++    # inventory change exempts repeats like returning to the fridge to cool.
++    INVENTORY_PREDICATES = frozenset({
++        "holds", "holdsany", "holdsanyreceptacleobject",
++        "not_holds", "not_holdsany", "not_holdsanyreceptacleobject",
++    })
++
++    # The agent's own position: 'atlocation agent1 loc N' (agent-only in
++    # alfred.pddl; receptacles/objects use receptacleatlocation and
++    # objectatlocation). Always unioned into every entity slice so a retry
++    # from a different position is exempt: a no-op recorded from the wrong
++    # spot (e.g. 'open drawer 2' from afar -> 'Nothing happens') must not
++    # flag the now-effective retry after 'go to drawer 2'. Deliberately
++    # WITHOUT 'not_atlocation': those negated markers persist for every
++    # location the agent has ever left (verified empirically), so including
++    # them would turn the slice into a visit history and wrongly exempt
++    # round-trip repeats.
++    AGENT_POSITION_PREDICATES = frozenset({"atlocation"})
++
++    # Verbs whose observed command templates carry one/two entity arguments
++    # (vocabulary confirmed against recorded rollouts: go to X, examine X,
++    # open/close X, take X from Y, move X to Y, use X, heat/cool/clean X with
++    # Y; 'put X in/on Y' and 'slice X with Y' kept for template completeness).
++    _ACTION_PATTERNS = [
++        re.compile(r"^go to (?P<a>.+)$"),
++        re.compile(r"^examine (?P<a>.+)$"),
++        re.compile(r"^open (?P<a>.+)$"),
++        re.compile(r"^close (?P<a>.+)$"),
++        re.compile(r"^use (?P<a>.+)$"),
++        re.compile(r"^take (?P<a>.+) from (?P<b>.+)$"),
++        re.compile(r"^move (?P<a>.+) to (?P<b>.+)$"),
++        re.compile(r"^put (?P<a>.+) in/on (?P<b>.+)$"),
++        re.compile(r"^heat (?P<a>.+) with (?P<b>.+)$"),
++        re.compile(r"^cool (?P<a>.+) with (?P<b>.+)$"),
++        re.compile(r"^clean (?P<a>.+) with (?P<b>.+)$"),
++        re.compile(r"^slice (?P<a>.+) with (?P<b>.+)$"),
++    ]
++
++    def __init__(self):
++        self.reset()
++
++    def reset(self):
++        # normalized action -> set of post-state entity slices recorded at
++        # each no-op execution of that action ("at some t'" is existential).
++        self._noop_slices = {}
++        self._streak = 0
++
++    def pre_step(self, action_text, current_facts):
++        """Decide, before executing, whether repeating `action_text` is futile.
++
++        Returns (futile, streak); streak is the 1-based consecutive-futile
++        index, 0 when not futile. Never raises: degrades to (False, 0).
++        """
++        try:
++            futile = self._is_futile(action_text, current_facts)
++        except Exception:
++            futile = False
++        if futile:
++            self._streak += 1
++        else:
++            self._streak = 0
++        return futile, self._streak
++
++    def post_step(self, action_text, feedback_text, pre_facts, post_facts):
++        """Record the execution outcome; call after env.step. Never raises."""
++        try:
++            targets = self._parse_targets(action_text)
++            if targets is None or post_facts is None:
++                return
++            if self._is_noop(feedback_text, pre_facts, post_facts):
++                key = self._normalize(action_text)
++                slices = self._noop_slices.setdefault(key, set())
++                # POST-state snapshot convention: includes epistemic markers
++                # (e.g. checked) gained at t', so the very next identical
++                # repeat already matches and gets flagged.
++                slices.add(self._entity_slice(post_facts, targets))
++        except Exception:
++            pass
++
++    # ------------------------------------------------------------------ #
++
++    def _is_futile(self, action_text, current_facts):
++        targets = self._parse_targets(action_text)
++        if targets is None or current_facts is None:
++            return False
++        recorded = self._noop_slices.get(self._normalize(action_text))
++        if not recorded:
++            return False
++        return self._entity_slice(current_facts, targets) in recorded
++
++    @staticmethod
++    def _normalize(action_text):
++        return " ".join(str(action_text).strip().lower().split())
++
++    @classmethod
++    def _parse_targets(cls, action_text):
++        """Target entity names of an action, or None if the action can never
++        be futile (look/inventory/other argument-less or unparseable text)."""
++        action = cls._normalize(action_text)
++        for pattern in cls._ACTION_PATTERNS:
++            match = pattern.match(action)
++            if match:
++                return frozenset(v.strip() for v in match.groupdict().values() if v)
++        return None
++
++    @staticmethod
++    def _fact_keys(facts):
++        """Facts as hashable (predicate, arg-names) pairs. Accepts textworld
++        Proposition objects or already-converted (name, args) tuples."""
++        keys = set()
++        for fact in facts:
++            if isinstance(fact, tuple):
++                name, args = fact
++                keys.add((name, tuple(str(a).strip() for a in args)))
++            else:
++                keys.add((fact.name,
++                          tuple(str(a.name).strip() for a in fact.arguments)))
++        return keys
++
++    @classmethod
++    def _entity_slice(cls, facts, targets):
++        return frozenset(
++            key for key in cls._fact_keys(facts)
++            if key[0] in cls.INVENTORY_PREDICATES
++            or key[0] in cls.AGENT_POSITION_PREDICATES
++            or any(arg in targets for arg in key[1]))
++
++    @classmethod
++    def _is_noop(cls, feedback_text, pre_facts, post_facts):
++        if str(feedback_text).strip().startswith("Nothing happens"):
++            return True
++        if pre_facts is None:
++            return False
++        diff = cls._fact_keys(pre_facts) ^ cls._fact_keys(post_facts)
++        return all(key[0] in cls.EPISTEMIC_PREDICATES for key in diff)
+diff --git a/agent_system/environments/prompts/alfworld.py b/agent_system/environments/prompts/alfworld.py
+index 6f72445..95ddf84 100644
+--- a/agent_system/environments/prompts/alfworld.py
++++ b/agent_system/environments/prompts/alfworld.py
+@@ -33,4 +33,22 @@ Your admissible actions of the current situation are: [{admissible_actions}].
+ Now it's your turn to take an action.
+ You should first reason step-by-step about the current situation. This reasoning process MUST be enclosed within <think> </think> tags. 
+ Once you've finished your reasoning, you should choose an admissible action for current step and present it within <action> </action> tags.
+-"""
+\ No newline at end of file
++"""
++
++# Stage-2 variants (selected via env.stage2_prompt): identical to the templates above
++# except for one extra history-review sentence. Derived via replace so the base text
++# can never drift out of sync.
++_STAGE2_HISTORY_SENTENCE = (
++    "In your reasoning, first briefly review your interaction history — what you have already tried "
++    "and what each attempt revealed — and take it into account when choosing your next action."
++)
++
++ALFWORLD_TEMPLATE_NO_HIS_STAGE2 = ALFWORLD_TEMPLATE_NO_HIS.replace(
++    "You should first reason step-by-step about the current situation.",
++    "You should first reason step-by-step about the current situation. " + _STAGE2_HISTORY_SENTENCE,
++)
++
++ALFWORLD_TEMPLATE_STAGE2 = ALFWORLD_TEMPLATE.replace(
++    "You should first reason step-by-step about the current situation.",
++    "You should first reason step-by-step about the current situation. " + _STAGE2_HISTORY_SENTENCE,
++)
+\ No newline at end of file
+diff --git a/agent_system/multi_turn_rollout/rollout_loop.py b/agent_system/multi_turn_rollout/rollout_loop.py
+index d79e678..fa49d41 100644
+--- a/agent_system/multi_turn_rollout/rollout_loop.py
++++ b/agent_system/multi_turn_rollout/rollout_loop.py
+@@ -238,10 +238,11 @@ class TrajectoryCollector:
+             success: Dict[str, np.ndarray],
+             traj_uid: np.ndarray,
+             tool_callings: np.ndarray,
++            success_prefilter: Dict[str, np.ndarray] = None,
+             ) -> DataProto:
+         """
+         Collect and organize trajectory data, handling batch size adjustments to meet parallel training requirements.
+-        
++
+         Parameters:
+             total_batch_list (List[List[Dict]): List of trajectory data for each environment
+             episode_rewards (np.ndarray): Total rewards for each environment
+@@ -249,6 +250,8 @@ class TrajectoryCollector:
+             success (Dict[str, np.ndarray]): Success samples for each environment
+             traj_uid (np.ndarray): Trajectory unique identifiers
+             tool_callings (np.ndarray): Number of tool callings for each environment
++            success_prefilter (Dict[str, np.ndarray]): Success samples before dynamic-sampling
++                group filtering; None outside the dynamic path (then equals `success`)
+         Returns:
+             DataProto: Collected and organized trajectory data
+         """
+@@ -257,9 +260,24 @@ class TrajectoryCollector:
+         success_rate = {}
+         for key, value in success.items():
+             success_rate[key] = np.mean(value)
++
++        # Unbiased train success rate for the futile-penalty annealing EMA:
++        # with DAPO dynamic sampling `success` only covers kept mixed-reward
++        # groups (all-success groups are dropped), so its mean is biased low.
++        # Key deliberately lacks the 'success_rate' substring so _validate's
++        # metric scan does not pick it up as a duplicate metric.
++        prefilter_src = success_prefilter if success_prefilter is not None else success
++        prefilter_sr = np.float32(np.mean(prefilter_src['success_rate'])
++                                  if 'success_rate' in prefilter_src else 0.0)
+         
+         effective_batch = []
+         for bs in range(batch_size):
++            # per-trajectory futile aggregates (uncapped; capping happens in the trainer).
++            # .get keeps non-ALFWorld rows at 0.
++            futile_weighted = np.float32(sum(float(data.get('futile_streak', 0))
++                                             for data in total_batch_list[bs] if data['active_masks']))
++            futile_count = np.int64(sum(bool(data.get('futile', False))
++                                        for data in total_batch_list[bs] if data['active_masks']))
+             # sum the rewards for each data in total_batch_list[bs]
+             for data in total_batch_list[bs]:
+                 assert traj_uid[bs] == data['traj_uid'], "data is not from the same trajectory"
+@@ -270,6 +288,11 @@ class TrajectoryCollector:
+                     data['episode_lengths'] = episode_lengths[bs]
+                     # tool_callings
+                     data['tool_callings'] = tool_callings[bs]
++                    # futile-repetition aggregates (constant across the trajectory's rows)
++                    data['futile_weighted'] = futile_weighted
++                    data['futile_count'] = futile_count
++                    # pre-filter train success rate (constant across all rows)
++                    data['prefilter_sr'] = prefilter_sr
+                     # success_rate
+                     for key, value in success_rate.items():
+                         data[key] = value
+@@ -376,6 +399,14 @@ class TrajectoryCollector:
+             else:
+                 batch.non_tensor_batch['is_action_valid'] = np.ones(batch_size, dtype=bool)
+ 
++            # futile-repetition info (ALFWorld only); defaults keep row keys uniform for collate_fn
++            if 'futile' in infos[0]:
++                batch.non_tensor_batch['futile'] = np.array([bool(info.get('futile', False)) for info in infos], dtype=bool)
++                batch.non_tensor_batch['futile_streak'] = np.array([int(info.get('futile_streak', 0)) for info in infos], dtype=np.int64)
++            else:
++                batch.non_tensor_batch['futile'] = np.zeros(batch_size, dtype=bool)
++                batch.non_tensor_batch['futile_streak'] = np.zeros(batch_size, dtype=np.int64)
++
+             if 'tool_calling' in infos[0]:
+                 tool_callings[active_masks] += np.array([info['tool_calling'] for info in infos], dtype=np.float32)[active_masks]
+             # Create reward tensor, only assign rewards for active environments
+@@ -435,11 +466,13 @@ class TrajectoryCollector:
+             total_episode_lengths (np.ndarray): Lengths per episode.
+             total_success (Dict[str, np.ndarray]): Success metrics.
+             total_traj_uid (np.ndarray): Trajectory IDs.
++            total_success_prefilter (Dict[str, np.ndarray]): Success metrics before group filtering.
+         """
+         total_batch_list = []
+         total_episode_rewards = []
+         total_episode_lengths = []
+         total_success = []
++        total_success_prefilter = []
+         total_traj_uid = []
+         total_tool_callings = []
+         try_count: int = 0
+@@ -456,7 +489,10 @@ class TrajectoryCollector:
+                 actor_rollout_wg=actor_rollout_wg,
+                 envs=envs,
+             )
+-            batch_list, episode_rewards, episode_lengths, success, traj_uid, tool_callings = filter_group_data(batch_list=batch_list, 
++            # keep the unfiltered success samples: filter_group_data drops
++            # all-equal-reward groups, which biases the kept success rate low
++            total_success_prefilter.append(success)
++            batch_list, episode_rewards, episode_lengths, success, traj_uid, tool_callings = filter_group_data(batch_list=batch_list,
+                                                                                                 episode_rewards=episode_rewards, 
+                                                                                                 episode_lengths=episode_lengths, 
+                                                                                                 success=success, 
+@@ -476,10 +512,11 @@ class TrajectoryCollector:
+         total_episode_rewards = np.concatenate(total_episode_rewards, axis=0)
+         total_episode_lengths = np.concatenate(total_episode_lengths, axis=0)
+         total_success = {key: np.concatenate([success[key] for success in total_success], axis=0) for key in total_success[0].keys()}
++        total_success_prefilter = {key: np.concatenate([np.asarray(success[key]) for success in total_success_prefilter], axis=0) for key in total_success_prefilter[0].keys()}
+         total_traj_uid = np.concatenate(total_traj_uid, axis=0)
+         total_tool_callings = np.concatenate(total_tool_callings, axis=0)
+ 
+-        return total_batch_list, total_episode_rewards, total_episode_lengths, total_success, total_traj_uid, total_tool_callings
++        return total_batch_list, total_episode_rewards, total_episode_lengths, total_success, total_traj_uid, total_tool_callings, total_success_prefilter
+ 
+     def multi_turn_loop(
+             self,
+@@ -506,20 +543,21 @@ class TrajectoryCollector:
+         # Initial observations from the environment
+         if self.config.algorithm.filter_groups.enable and is_train:
+             # Dynamic Sampling (for DAPO and Dynamic GiGPO)
+-            total_batch_list, total_episode_rewards, total_episode_lengths, total_success, total_traj_uid, totoal_tool_callings = \
++            total_batch_list, total_episode_rewards, total_episode_lengths, total_success, total_traj_uid, totoal_tool_callings, total_success_prefilter = \
+                 self.dynamic_multi_turn_loop(
+                 gen_batch=gen_batch,
+                 actor_rollout_wg=actor_rollout_wg,
+                 envs=envs,
+             )
+         else:
+-            # Vanilla Sampling   
++            # Vanilla Sampling
+             total_batch_list, total_episode_rewards, total_episode_lengths, total_success, total_traj_uid, totoal_tool_callings = \
+                 self.vanilla_multi_turn_loop(
+                 gen_batch=gen_batch,
+                 actor_rollout_wg=actor_rollout_wg,
+                 envs=envs,
+             )
++            total_success_prefilter = total_success  # nothing filtered
+         assert len(total_batch_list) == len(total_episode_rewards)
+         assert len(total_batch_list) == len(total_episode_lengths)
+         assert len(total_batch_list) == len(total_traj_uid)
+@@ -534,6 +572,7 @@ class TrajectoryCollector:
+             success=total_success,
+             traj_uid=total_traj_uid,
+             tool_callings=totoal_tool_callings,
++            success_prefilter=total_success_prefilter,
+         )
+         
+         return gen_batch_output
+diff --git a/tests_stage2/test_futile_tracker_cpu.py b/tests_stage2/test_futile_tracker_cpu.py
+new file mode 100644
+index 0000000..5fa382e
+--- /dev/null
++++ b/tests_stage2/test_futile_tracker_cpu.py
+@@ -0,0 +1,320 @@
++"""CPU integration test for the Stage 2 futile-repetition tracker.
++
++Drives the real ALFWorld env worker (AlfworldWorker in agent_system/
++environments/env_package/alfworld/envs.py — the exact class AlfworldEnvs
++wraps with ray.remote) through scripted action sequences and asserts the
++tracker contract exposed by the env worker: info['futile'] (bool) and
++info['futile_streak'] (int, consecutive-futile streak index, 0 when not
++futile).
++
++Deliberately Ray-free: ray.remote is applied to AlfworldWorker only inside
++AlfworldEnvs, so instantiating the worker directly exercises the identical
++step()/reset() code without starting a Ray cluster (which a live training
++run may already own on this machine).
++
++Patterns (from the validated Stage 2 design):
++  (a) examine X twice with nothing between -> 2nd flagged (streak 1);
++      third -> streak 2;
++  (b) examine A -> visit/open B elsewhere -> return -> examine A again ->
++      flagged (a round trip does not exempt);
++  (c) take an object from receptacle R -> examine R again -> NOT flagged
++      (R's entity slice changed);
++  (d) first-time failed/no-op action -> never flagged on first execution;
++  (e) a no-op 'open X' from the wrong position, retried after 'go to X',
++      is NOT flagged (the agent's position is part of every entity slice).
++
++Suitable entities are discovered at runtime from admissible commands; if a
++sampled game cannot express pattern (b), (c) or (e) after a few episodes the
++pattern is skipped with a message. Patterns (a) and (d) must always run;
++failure to set them up counts as FAIL.
++
++Run with:
++  CUDA_VISIBLE_DEVICES="" ALFWORLD_DATA=/home/yuhan/.cache/alfworld \
++    /home/yuhan/verl-agent/.venv/bin/python \
++    /home/yuhan/verl-agent/tests_stage2/test_futile_tracker_cpu.py
++"""
++import os
++import sys
++
++os.environ.setdefault("ALFWORLD_DATA", "/home/yuhan/.cache/alfworld")
++os.environ["CUDA_VISIBLE_DEVICES"] = ""
++
++REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
++sys.path.insert(0, REPO_ROOT)
++
++from agent_system.environments.env_package.alfworld.envs import (  # noqa: E402
++    AlfworldWorker,
++    compute_reward,
++    load_config_file,
++)
++from agent_system.environments.env_package.alfworld.alfworld.agents.environment import (  # noqa: E402
++    get_environment,
++)
++
++CONFIG_PATH = os.path.join(
++    REPO_ROOT, "agent_system/environments/env_package/alfworld/configs/config_tw.yaml"
++)
++MAX_GAMES = 6          # episodes to try per pattern before giving up
++MAX_RECEPTACLES = 8    # go-to targets to probe within one episode
++
++
++class TrackerKeysMissing(Exception):
++    pass
++
++
++class SingleEnv:
++    """Drives one real AlfworldWorker directly (no Ray), unwrapping the
++    per-key [0] lists exactly as AlfworldEnvs.step/reset do."""
++
++    def __init__(self, seed=0):
++        config = load_config_file(CONFIG_PATH)
++        env_type = config["env"]["type"]
++        base_env = get_environment(env_type)(config, train_eval="train")
++        self.worker = AlfworldWorker(config, seed, base_env)
++
++    @staticmethod
++    def _unwrap(info):
++        return {k: v[0] for k, v in info.items()}
++
++    def reset(self):
++        obs, infos = self.worker.reset()
++        info = self._unwrap(infos)
++        return obs[0], info
++
++    def step(self, action):
++        obs, scores, dones, infos = self.worker.step(action)
++        info = self._unwrap(infos)
++        return obs[0], compute_reward(info, multi_modal=False), dones[0], info
++
++    def close(self):
++        close = getattr(self.worker.env, "close", None)
++        if close is not None:
++            close()
++
++
++def admissible(info):
++    return list(info.get("admissible_commands", []))
++
++
++def goto_targets(info):
++    return [c[len("go to "):] for c in admissible(info) if c.startswith("go to ")]
++
++
++def futile_of(info):
++    if "futile" not in info or "futile_streak" not in info:
++        raise TrackerKeysMissing(
++            "info dict lacks 'futile'/'futile_streak' — tracker not wired into "
++            "the env worker (keys present: %s)" % sorted(info.keys())
++        )
++    return bool(info["futile"]), int(info["futile_streak"])
++
++
++def find_examinable_receptacle(env, info):
++    """Walk go-to targets until one whose 'examine <t>' is admissible on
++    arrival. Returns (target, info, done); target is None if none found."""
++    done = False
++    for t in goto_targets(info)[:MAX_RECEPTACLES]:
++        _, _, done, info = env.step(f"go to {t}")
++        if done:
++            return None, info, done
++        if f"examine {t}" in admissible(info):
++            return t, info, done
++    return None, info, done
++
++
++def pattern_a(env):
++    """examine X three times: 1st clean, 2nd futile streak 1, 3rd streak 2."""
++    for _ in range(MAX_GAMES):
++        _, info = env.reset()
++        target, info, done = find_examinable_receptacle(env, info)
++        if target is None or done:
++            continue
++        exam = f"examine {target}"
++        _, _, done, info = env.step(exam)
++        f1, s1 = futile_of(info)
++        if f1 or s1 != 0:
++            return f"FAIL: first '{exam}' flagged (futile={f1}, streak={s1})"
++        if done:
++            continue
++        _, _, done, info = env.step(exam)
++        f2, s2 = futile_of(info)
++        if not (f2 and s2 == 1):
++            return f"FAIL: second '{exam}' expected futile streak 1, got (futile={f2}, streak={s2})"
++        if done:
++            continue
++        _, _, done, info = env.step(exam)
++        f3, s3 = futile_of(info)
++        if not (f3 and s3 == 2):
++            return f"FAIL: third '{exam}' expected futile streak 2, got (futile={f3}, streak={s3})"
++        return "PASS"
++    return f"FAIL: no examinable receptacle found in {MAX_GAMES} games (pattern must run)"
++
++
++def pattern_b(env):
++    """examine A -> detour to B (open it if possible) -> return -> examine A
++    again: still flagged, the round trip does not exempt (the agent is back
++    at A, so its position matches the recorded no-op slice)."""
++    for _ in range(MAX_GAMES):
++        _, info = env.reset()
++        all_targets = goto_targets(info)
++        if len(all_targets) < 2:
++            continue
++        a, info, done = find_examinable_receptacle(env, info)
++        if a is None or done:
++            continue
++        _, _, done, info = env.step(f"examine {a}")
++        fa, sa = futile_of(info)
++        if fa:
++            return f"FAIL: first 'examine {a}' flagged (futile={fa}, streak={sa})"
++        if done:
++            continue
++        b = next((t for t in all_targets if t != a), None)
++        _, _, done, info = env.step(f"go to {b}")
++        if done:
++            continue
++        if f"open {b}" in admissible(info):
++            _, _, done, info = env.step(f"open {b}")
++            if done:
++                continue
++        _, _, done, info = env.step(f"go to {a}")
++        if done:
++            continue
++        _, _, _, info = env.step(f"examine {a}")
++        f, s = futile_of(info)
++        if f and s == 1:
++            return "PASS"
++        return f"FAIL: 'examine {a}' after round trip expected futile streak 1, got (futile={f}, streak={s})"
++    return f"SKIP: no game with two receptacles and an examinable A in {MAX_GAMES} games"
++
++
++def pattern_c(env):
++    """examine R -> take an object from R -> examine R again: NOT flagged,
++    because R's entity slice (contents + inventory) changed."""
++    for _ in range(MAX_GAMES):
++        _, info = env.reset()
++        done = False
++        for t in goto_targets(info)[:MAX_RECEPTACLES]:
++            _, _, done, info = env.step(f"go to {t}")
++            if done:
++                break
++            if f"open {t}" in admissible(info):
++                _, _, done, info = env.step(f"open {t}")
++                if done:
++                    break
++            exam = f"examine {t}"
++            takes = [
++                c for c in admissible(info)
++                if c.startswith("take ") and c.endswith(f" from {t}")
++            ]
++            if not takes or exam not in admissible(info):
++                continue
++            _, _, done, info = env.step(exam)
++            f1, s1 = futile_of(info)
++            if f1:
++                return f"FAIL: first '{exam}' flagged (futile={f1}, streak={s1})"
++            if done:
++                break
++            _, _, done, info = env.step(takes[0])
++            if done:
++                break
++            _, _, _, info = env.step(exam)
++            f2, s2 = futile_of(info)
++            if not f2 and s2 == 0:
++                return "PASS"
++            return f"FAIL: '{exam}' after '{takes[0]}' flagged (futile={f2}, streak={s2}) though slice changed"
++    return f"SKIP: no receptacle with a takeable object found in {MAX_GAMES} games"
++
++
++def pattern_d(env):
++    """A first-time failed/no-op action is never flagged."""
++    for _ in range(MAX_GAMES):
++        _, info = env.reset()
++        targets = goto_targets(info)
++        if not targets:
++            continue
++        # Examining a receptacle we are not at yields "Nothing happens" — a
++        # genuine first-time failed action on a real entity. If every examine
++        # happens to be admissible, the first (state no-op) execution still
++        # must not be flagged.
++        cand = next(
++            (f"examine {t}" for t in targets if f"examine {t}" not in admissible(info)),
++            f"examine {targets[0]}",
++        )
++        _, _, _, info = env.step(cand)
++        f, s = futile_of(info)
++        if not f and s == 0:
++            return "PASS"
++        return f"FAIL: first-time no-op '{cand}' flagged (futile={f}, streak={s})"
++    return f"FAIL: no go-to targets in {MAX_GAMES} games (pattern must run)"
++
++
++def pattern_e(env):
++    """'open X' from the wrong position ('Nothing happens'), then 'go to X'
++    and retry: the retry succeeds and must NOT be flagged — the agent's
++    position is part of the entity slice, so the recorded no-op slice no
++    longer matches."""
++    for _ in range(MAX_GAMES):
++        obs, info = env.reset()
++        done = False
++        for t in goto_targets(info)[:MAX_RECEPTACLES]:
++            obs, _, done, info = env.step(f"open {t}")
++            if done:
++                break
++            f0, s0 = futile_of(info)
++            if f0:
++                return f"FAIL: first-time 'open {t}' from afar flagged (futile={f0}, streak={s0})"
++            if not str(obs).strip().startswith("Nothing happens"):
++                continue  # not a no-op from here; try another receptacle
++            obs, _, done, info = env.step(f"go to {t}")
++            if done:
++                break
++            if f"open {t}" not in admissible(info):
++                continue  # not openable (or already open); try another
++            obs, _, done, info = env.step(f"open {t}")
++            f, s = futile_of(info)
++            if str(obs).strip().startswith("Nothing happens"):
++                continue  # retry did not actually succeed; inconclusive
++            if not f and s == 0:
++                return "PASS"
++            return f"FAIL: successful retry 'open {t}' after 'go to {t}' flagged (futile={f}, streak={s})"
++        if done:
++            continue
++    return f"SKIP: no openable receptacle reachable for the retry pattern in {MAX_GAMES} games"
++
++
++def main():
++    env = SingleEnv(seed=0)
++    patterns = [
++        ("a: repeat examine escalates streak", pattern_a),
++        ("b: round trip does not exempt", pattern_b),
++        ("c: changed slice exempts repeat", pattern_c),
++        ("d: first execution never flagged", pattern_d),
++        ("e: position change exempts retry", pattern_e),
++    ]
++    results = []
++    try:
++        for name, fn in patterns:
++            try:
++                verdict = fn(env)
++            except TrackerKeysMissing as exc:
++                verdict = f"FAIL: {exc}"
++            except Exception as exc:  # keep going so all patterns report
++                verdict = f"FAIL: unexpected exception {exc!r}"
++            results.append((name, verdict))
++            print(f"[{verdict.split(':')[0]}] pattern {name} -> {verdict}")
++    finally:
++        env.close()
++
++    failed = [name for name, v in results if v.startswith("FAIL")]
++    print()
++    for name, verdict in results:
++        print(f"  pattern {name}: {verdict}")
++    if failed:
++        print(f"\n{len(failed)} pattern(s) FAILED: {failed}")
++        sys.exit(1)
++    print("\nAll required patterns passed.")
++    sys.exit(0)
++
++
++if __name__ == "__main__":
++    main()
+diff --git a/verl/trainer/config/ppo_trainer.yaml b/verl/trainer/config/ppo_trainer.yaml
+index d0f68ba..0dbf0e5 100644
+--- a/verl/trainer/config/ppo_trainer.yaml
++++ b/verl/trainer/config/ppo_trainer.yaml
+@@ -57,6 +57,10 @@ actor_rollout_ref:
+     entropy_coeff: 0.001
+     use_invalid_action_penalty: True
+     invalid_action_penalty_coef: 0.1
++    use_futile_penalty: False
++    futile_penalty_coef: 0.25
++    futile_penalty_cap_units: 12
++    futile_sr_target: 0.7
+     use_kl_loss: False # True for GRPO
+     use_torch_compile: True # False to disable torch compile
+     kl_loss_coef: 0.001 # for grpo
+@@ -294,6 +298,7 @@ env:
+   seed: 0
+   max_steps: 50
+   history_length: 2
++  stage2_prompt: False # stage2 template variant with a history-review sentence (read by env_manager)
+   resources_per_worker: # resources for each env worker
+     num_cpus: 0.1
+     num_gpus: 0
+diff --git a/verl/trainer/ppo/ray_trainer.py b/verl/trainer/ppo/ray_trainer.py
+index d85e23a..b436d4e 100644
+--- a/verl/trainer/ppo/ray_trainer.py
++++ b/verl/trainer/ppo/ray_trainer.py
+@@ -223,6 +223,49 @@ def apply_invalid_action_penalty(data: DataProto, invalid_action_penalty_coef=fl
+     metrics = {'episode/valid_action_ratio': valid_action_ratio}
+     return data, metrics
+ 
++def apply_futile_penalty(data: DataProto, futile_penalty_coef=float, futile_penalty_cap_units=float):
++    # 'futile_weighted' is a per-trajectory float aggregated upstream by the env manager and
++    # replicated to every step row (same convention as 'episode_rewards'). If the env stack
++    # does not produce it, there is nothing to penalize.
++    if 'futile_weighted' not in data.non_tensor_batch:
++        return data, {}
++    reward_tensor = data.batch['token_level_scores']
++    if 'step_rewards' in data.batch.keys():
++        step_rewards = data.batch['step_rewards']
++    futile_weighted = data.non_tensor_batch['futile_weighted'].astype(np.float32)
++    penalties = futile_penalty_coef * np.minimum(futile_weighted, futile_penalty_cap_units)
++    for i in range(len(data)):
++        data_item = data[i]  # DataProtoItem
++
++        prompt_ids = data_item.batch['prompts']
++
++        prompt_length = prompt_ids.shape[-1]
++
++        valid_response_length = data_item.batch['attention_mask'][prompt_length:].sum()
++
++        # futile repetition penalty
++        reward_tensor[i, valid_response_length - 1] -= penalties[i]
++
++        if 'step_rewards' in data.batch.keys():
++            # Contract-mandated mirror of apply_invalid_action_penalty: the
++            # trajectory-level penalty hits every step row, which under GiGPO
++            # also lowers step advantages of non-futile steps in a futile
++            # trajectory. If a GiGPO arm ever enables this penalty, per-step
++            # attribution should use non_tensor_batch['futile_streak'] instead.
++            step_rewards[i] -= penalties[i]
++
++    # rows of the same trajectory carry identical values, so dedup by traj_uid for
++    # per-trajectory means instead of step-count-weighted ones
++    if 'traj_uid' in data.non_tensor_batch:
++        _, first_idx = np.unique(data.non_tensor_batch['traj_uid'], return_index=True)
++    else:
++        first_idx = np.arange(len(futile_weighted))
++    metrics = {
++        'futile/weighted_mean': float(np.mean(futile_weighted[first_idx])),
++        'futile/penalty_mean': float(np.mean(penalties[first_idx])),
++    }
++    return data, metrics
++
+ def compute_response_mask(data: DataProto):
+     """Compute the attention mask for the response part of the sequence.
+ 
+@@ -935,6 +978,13 @@ class RayPPOTrainer:
+         dataloader_state_dict = self.train_dataloader.state_dict()
+         torch.save(dataloader_state_dict, dataloader_local_path)
+ 
++        # persist the futile-penalty annealing state (gated so default runs
++        # write nothing new); without it a resume restarts at the max coef
++        if self.config.actor_rollout_ref.actor.get('use_futile_penalty', False):
++            futile_ema_path = os.path.join(local_global_step_folder, "futile_sr_ema.txt")
++            with open(futile_ema_path, "w") as f:
++                f.write(str(getattr(self, 'futile_sr_ema', 0.0)))
++
+         # latest checkpointed iteration tracker (for atomic usage)
+         local_latest_checkpointed_iteration = os.path.join(self.config.trainer.default_local_dir, "latest_checkpointed_iteration.txt")
+         with open(local_latest_checkpointed_iteration, "w") as f:
+@@ -991,6 +1041,13 @@ class RayPPOTrainer:
+         else:
+             print(f"Warning: No dataloader state found at {dataloader_local_path}, will start from scratch")
+ 
++        # restore the futile-penalty annealing EMA if this run persisted it
++        futile_ema_path = os.path.join(global_step_folder, "futile_sr_ema.txt")
++        if os.path.exists(futile_ema_path):
++            with open(futile_ema_path) as f:
++                self.futile_sr_ema = float(f.read().strip())
++            print(f"Restored futile_sr_ema={self.futile_sr_ema} from {futile_ema_path}")
++
+     def _balance_batch(self, batch: DataProto, metrics, logging_prefix="global_seqlen"):
+         """Reorder the data on single controller such that each dp rank gets similar total tokens"""
+         attention_mask = batch.batch["attention_mask"]
+@@ -1023,6 +1080,10 @@ class RayPPOTrainer:
+         )
+ 
+         self.global_steps = 0
++        # EMA of train-batch episode success rate, used to anneal the futile
++        # penalty; initialized before _load_checkpoint so a resume can restore
++        # the persisted value instead of restarting at the maximum coefficient.
++        self.futile_sr_ema = 0.0
+ 
+         # load checkpoint before doing anything
+         self._load_checkpoint()
+@@ -1207,6 +1268,30 @@ class RayPPOTrainer:
+                                                                                   )
+                             metrics.update(invalid_metrics)
+ 
++                        # compute rewards. apply_futile_penalty if enabled (train batches only;
++                        # validation goes through _validate and never reaches this path)
++                        if self.config.actor_rollout_ref.actor.get('use_futile_penalty', False):
++                            actor_cfg = self.config.actor_rollout_ref.actor
++                            # update the EMA from this train batch BEFORE penalizing;
++                            # prefer the pre-filter rate: under DAPO dynamic sampling
++                            # 'success_rate' covers only kept mixed-reward groups and
++                            # is biased low, which would keep the penalty from
++                            # annealing to zero
++                            if 'prefilter_sr' in batch.non_tensor_batch:
++                                batch_sr = float(batch.non_tensor_batch['prefilter_sr'][0])
++                                self.futile_sr_ema = 0.9 * self.futile_sr_ema + 0.1 * batch_sr
++                            elif 'success_rate' in batch.non_tensor_batch:
++                                batch_sr = float(batch.non_tensor_batch['success_rate'][0])
++                                self.futile_sr_ema = 0.9 * self.futile_sr_ema + 0.1 * batch_sr
++                            sr_target = max(float(actor_cfg.get('futile_sr_target', 0.7)), 1e-8)
++                            futile_coef_t = float(actor_cfg.get('futile_penalty_coef', 0.25)) * float(np.clip(1.0 - self.futile_sr_ema / sr_target, 0.0, 1.0))
++                            batch, futile_metrics = apply_futile_penalty(batch,
++                                                                         futile_penalty_coef=futile_coef_t,
++                                                                         futile_penalty_cap_units=float(actor_cfg.get('futile_penalty_cap_units', 12)),
++                                                                         )
++                            metrics.update({'futile/coef': futile_coef_t, 'futile/sr_ema': self.futile_sr_ema})
++                            metrics.update(futile_metrics)
++
+                         # compute rewards. apply_kl_penalty if available
+                         if self.config.algorithm.use_kl_in_reward:
+                             batch, kl_metrics = apply_kl_penalty(batch, kl_ctrl=self.kl_ctrl_in_reward, kl_penalty=self.config.algorithm.kl_penalty)
+-- 
+2.43.0
+
