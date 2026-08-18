@@ -55,10 +55,13 @@ else
   # 4x 80GB profile (this machine: H100 PCIe, NVLink pairs 0-1 / 2-3).
   GPUS=${GPUS:-0,1,2,3}
   ROLLOUT_TP=${ROLLOUT_TP:-2}
-  # 0.35 survives a co-tenant process on shared GPUs; on an exclusive node
-  # GPU_MEM_UTIL=0.6 PPO_MAX_TOKEN_LEN=16384 LOGPROB_MAX_TOKEN_LEN=32768
-  # is the measured H100 speed profile (~1.9x per-step).
-  GPU_MEM_UTIL=${GPU_MEM_UTIL:-0.35}
+  # Measured H100 speed profile (~1.9x per-step vs the conservative 0.35).
+  # 24576 OOMs in update_actor; 16384 is the safe ceiling. Drop back to
+  # GPU_MEM_UTIL=0.35 (and unset the token budgets) if another user's
+  # process is squatting on the cards.
+  GPU_MEM_UTIL=${GPU_MEM_UTIL:-0.6}
+  PPO_MAX_TOKEN_LEN=${PPO_MAX_TOKEN_LEN:-16384}
+  LOGPROB_MAX_TOKEN_LEN=${LOGPROB_MAX_TOKEN_LEN:-32768}
   FSDP_PARAM_OFFLOAD=${FSDP_PARAM_OFFLOAD:-true}
   FSDP_OPTIMIZER_OFFLOAD=${FSDP_OPTIMIZER_OFFLOAD:-true}
   ENFORCE_EAGER=${ENFORCE_EAGER:-true}
@@ -102,5 +105,7 @@ FSDP_OPTIMIZER_OFFLOAD="$FSDP_OPTIMIZER_OFFLOAD" \
 ENFORCE_EAGER="$ENFORCE_EAGER" \
 FREE_CACHE_ENGINE="$FREE_CACHE_ENGINE" \
 MAX_PROMPT_LENGTH="$MAX_PROMPT_LENGTH" \
+PPO_MAX_TOKEN_LEN="${PPO_MAX_TOKEN_LEN:-}" \
+LOGPROB_MAX_TOKEN_LEN="${LOGPROB_MAX_TOKEN_LEN:-}" \
 USE_FUTILE_PENALTY="$USE_FUTILE_PENALTY" \
 exec bash "$REPO_ROOT/scripts/train_policy_grpo_stage2.sh" "$@"
