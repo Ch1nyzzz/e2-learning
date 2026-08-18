@@ -1,13 +1,22 @@
-# Build context for docker/Dockerfile: only docker/* is COPYed, so keep the
-# context small and free of local artifacts.
+# Keep the build context small. The image COPYs the repo last; huge local
+# artifacts must stay out.
 .git/
 .venv/
 .venv-verl/
 .pytest_cache/
 .ruff_cache/
+.mypy_cache/
+.cursor/
 __pycache__/
 *.pyc
 outputs/
 data/
+checkpoints/
 runs/
+wandb/
+e2l-train-image/
 references/
+*.sqlite3
+.alfworld/
+AGENTS.md
+.env

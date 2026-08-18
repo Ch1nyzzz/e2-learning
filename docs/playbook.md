@@ -7,12 +7,11 @@
 
 | 东西 | 从哪来 | 说明 |
 |---|---|---|
-| e2-learning 仓库 | `git clone https://github.com/Ch1nyzzz/e2-learning.git` | 训练脚本、本文档、`docker/` |
-| 训练镜像 | HF `erv1n/e2l-train-image`（或本地 `docker build`） | 含 verl-agent(stage2) 与 RWML 两套环境 |
-| 冷启动 ckpt ×2 + RWML 数据 | HF `erv1n/e2l-*`（public） | `scripts/pull_hf_artifacts.sh` 一键拉 |
+| 训练镜像 | HF `erv1n/e2l-train-image` | **代码 + 环境**已打进镜像（`/workspace/e2-learning` + verl-agent/RWML） |
+| 冷启动 ckpt ×2 + RWML 数据 | HF `erv1n/e2l-*`（public） | 进容器后 `scripts/pull_hf_artifacts.sh` |
 | 基座模型 ×3 | HF `Qwen/*` | 预拉或训练首次自动下载 |
 | ALFWorld 游戏数据 | `alfworld-download` | 容器内跑一次即可 |
-| verl-agent | 镜像内已带；非 Docker 路线跑 `scripts/setup_verl_agent.sh` | 上游 `20bd331` 原样 + 本仓库补丁（工作区 diff 形式），见 §9.2 |
+| e2-learning git 仓库 | `https://github.com/Ch1nyzzz/e2-learning.git` | 只在自己重打镜像或看文档时需要 |
 
 ## 1. 机器要求
 
@@ -22,11 +21,9 @@
 
 ## 2. 拿训练镜像
 
-先 clone 仓库，再从 Hugging Face 拉预构建包（~21GB）load 进 Docker。不必自己 `docker build`。
+不需要 `git clone`。从 Hugging Face 拉预构建包（~21GB）load 进 Docker 即可。
 
 ```bash
-git clone https://github.com/Ch1nyzzz/e2-learning.git && cd e2-learning
-
 hf download erv1n/e2l-train-image --repo-type dataset --local-dir ./e2l-train-image
 cd e2l-train-image
 sha256sum -c e2l-train.tar.gz.sha256
@@ -36,9 +33,10 @@ cd ..
 
 下载慢或 huggingface.co 不通时：`export HF_ENDPOINT=https://hf-mirror.com` 后再跑 `hf download`。
 
-备选：自己构建（1–2 小时，需能访问 GitHub / PyPI / Docker Hub）：
+备选：自己构建（1–2 小时，需能访问 GitHub / PyPI / Docker Hub；会把当前仓库打进镜像）：
 
 ```bash
+git clone https://github.com/Ch1nyzzz/e2-learning.git && cd e2-learning
 docker build -f docker/Dockerfile -t e2l-train:latest .
 ```
 
@@ -46,7 +44,8 @@ docker build -f docker/Dockerfile -t e2l-train:latest .
 
 - `/opt/verl-agent`：verl-agent 上游 `20bd331` 原样检出 + `patches/verl-agent-stage2-dual-reward.patch`（以工作区 diff 形式打上，= 未推送的 stage2-dual-reward 改动 559f9bd），装进系统 python 3.12（torch 2.8.0 / vllm 0.11.0 / flash-attn 2.8.3，下称 **env A**）
 - `/opt/venvs/rwml`：python 3.10 独立 venv（verl 0.4.1 / vllm 0.8.3 / torch 2.6.0，**env B**），只给 E6 RWML 基线用
-- 已预设 `VERL_AGENT_DIR`、`VERL_PYTHON`、`VERL_VENV_PYTHON`，训练脚本开箱即用
+- `/workspace/e2-learning`：本仓库训练脚本、配置、`.env.example`（含 W&B key）
+- 已预设 `VERL_AGENT_DIR`、`VERL_PYTHON`、`VERL_VENV_PYTHON`，工作目录就是仓库根，训练脚本开箱即用
 
 不用 Docker 也可以在已有 conda/venv 上手工复刻（与镜像同源）：
 
@@ -64,34 +63,47 @@ uv pip install --python .venv-verl/bin/python -r docker/requirements-rwml.txt
 
 ## 3. 拉模型与数据
 
+先在宿主机准备一个工作目录（checkpoint / 数据 / 日志都落这里，容器删了也不丢）：
+
 ```bash
-# ① 冷启动 ckpt ×2 + RWML 数据（~60GB；默认命名空间 erv1n，可 HF_NAMESPACE 覆盖）
-bash scripts/pull_hf_artifacts.sh
+WORK=/data/e2l   # 改成你盘上的路径
+mkdir -p "$WORK"/{checkpoints,outputs,data,runs,wandb,alfworld}
+```
 
-# ② 基座模型（~50GB；不预拉则训练首次自动下载）
-hf download Qwen/Qwen2.5-7B-Instruct
-hf download Qwen/Qwen3-8B
-hf download Qwen/Qwen3-Embedding-0.6B
+ALFWorld 游戏数据（容器外跑一次，落到挂载卷）：
 
-# ③ ALFWorld 游戏数据（容器内跑一次，落到挂载卷）
-docker run --rm -v /path/to/alfworld-data:/data/alfworld e2l-train:latest \
+```bash
+docker run --rm -v "$WORK/alfworld":/data/alfworld e2l-train:latest \
   alfworld-download --data-dir /data/alfworld
 ```
+
+冷启动 ckpt、RWML 数据、基座模型在进容器之后拉（见 §4）。
 
 ## 4. 启动容器
 
 ```bash
 docker run --gpus all -it --name e2l --shm-size=64g \
-  -v $PWD:/workspace/e2-learning \
-  -v /path/to/alfworld-data:/data/alfworld \
-  -v $HOME/.cache/huggingface:/root/.cache/huggingface \
+  -v "$WORK/checkpoints":/workspace/e2-learning/checkpoints \
+  -v "$WORK/outputs":/workspace/e2-learning/outputs \
+  -v "$WORK/data":/workspace/e2-learning/data \
+  -v "$WORK/runs":/workspace/e2-learning/runs \
+  -v "$WORK/wandb":/workspace/e2-learning/wandb \
+  -v "$WORK/alfworld":/data/alfworld \
+  -v "$HOME/.cache/huggingface":/root/.cache/huggingface \
   -e ALFWORLD_DATA=/data/alfworld \
   e2l-train:latest
-# 进容器后：
-cd /workspace/e2-learning
 ```
 
-要点：仓库以挂载方式进容器（脚本改动即时生效、checkpoint 直接落宿主机盘）；HF cache 挂载避免重复下载。W&B key 已写在 `.env.example`（随仓库走），训练脚本会自动读；run 文件写在仓库 `wandb/`（已 gitignore）。
+工作目录已是 `/workspace/e2-learning`，不用再 mount 仓库。进容器后拉权重和 RWML 数据：
+
+```bash
+bash scripts/pull_hf_artifacts.sh
+hf download Qwen/Qwen2.5-7B-Instruct
+hf download Qwen/Qwen3-8B
+hf download Qwen/Qwen3-Embedding-0.6B
+```
+
+W&B key 已在镜像内 `.env.example`，训练脚本会自动读。HF cache 挂在宿主机，避免重复下载。
 
 ## 5. 自检（10 分钟）
 
@@ -105,7 +117,7 @@ cd /opt/verl-agent && CUDA_VISIBLE_DEVICES="" ALFWORLD_DATA=/data/alfworld \
 
 ## 6. 正式训练（6 臂）
 
-W&B 默认开：项目 `e2l_policy_grpo`（E6 为 `e2l_rwml`），run 名即 `EXPERIMENT_NAME`。API key 已在 `.env.example`，clone 下来即可用。上不了 wandb.ai 时加 `WANDB_MODE=offline`，训完在仓库根目录 `wandb sync wandb/`。只要 console：`LOGGER="['console']"`。
+W&B 默认开：项目 `e2l_policy_grpo`（E6 为 `e2l_rwml`），run 名即 `EXPERIMENT_NAME`。API key 已在镜像内 `.env.example`。上不了 wandb.ai 时加 `WANDB_MODE=offline`，训完在仓库根目录 `wandb sync wandb/`。只要 console：`LOGGER="['console']"`。
 
 8 卡统一前缀（对齐 verl-agent 官方与 8 卡开源配置，依据见 `scripts/train_policy_grpo_stage2.sh` 头注释）：
 

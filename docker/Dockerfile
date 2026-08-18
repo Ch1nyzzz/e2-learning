@@ -10,6 +10,8 @@
 #                     docs/playbook.md.
 #   /opt/venvs/rwml   isolated python 3.10 env for the RWML GRPO baseline
 #                     (verl 0.4.1 / vllm 0.8.3 / torch 2.6.0) = "env B".
+#   /workspace/e2-learning  this repository (scripts, configs, .env.example)
+#                           baked in so the remote machine does not need to git clone.
 #
 # Build:  docker build -f docker/Dockerfile -t e2l-train:latest .
 # Use:    see docs/playbook.md.
@@ -53,5 +55,12 @@ COPY docker/requirements-rwml.txt /tmp/requirements-rwml.txt
 RUN uv venv --python 3.10 /opt/venvs/rwml \
  && uv pip install --python /opt/venvs/rwml/bin/python -r /tmp/requirements-rwml.txt
 
-WORKDIR /workspace
-CMD ["bash"]
+# Training code last so env layers stay cached. Writable dirs are empty here
+# and should be bind-mounted from the host (see docs/playbook.md §4).
+COPY . /workspace/e2-learning
+WORKDIR /workspace/e2-learning
+RUN mkdir -p checkpoints outputs data runs wandb
+# Base image vllm/vllm-openai sets an OpenAI-server ENTRYPOINT; drop it so
+# `docker run` is a normal shell / command (alfworld-download, train scripts).
+ENTRYPOINT []
+CMD ["/bin/bash"]
