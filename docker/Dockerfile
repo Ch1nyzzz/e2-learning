@@ -26,7 +26,8 @@ ENV DEBIAN_FRONTEND=noninteractive \
     VERL_VENV_PYTHON=/opt/venvs/rwml/bin/python
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
-      git curl ca-certificates \
+      git curl ca-certificates python-is-python3 \
+      build-essential wget unzip \
     && rm -rf /var/lib/apt/lists/*
 
 # uv: builds the RWML venv now and lets the remote friend recreate

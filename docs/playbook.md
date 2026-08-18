@@ -8,7 +8,7 @@
 | 东西 | 从哪来 | 说明 |
 |---|---|---|
 | e2-learning 仓库 | `git clone https://github.com/Ch1nyzzz/e2-learning.git` | 训练脚本、本文档、`docker/` |
-| 训练镜像 | `docker/Dockerfile` 本地构建（或接收 `docker save` 包） | 含 verl-agent(stage2) 与 RWML 两套环境 |
+| 训练镜像 | HF `erv1n/e2l-train-image`（或本地 `docker build`） | 含 verl-agent(stage2) 与 RWML 两套环境 |
 | 冷启动 ckpt ×2 + RWML 数据 | HF `erv1n/e2l-*`（public） | `scripts/pull_hf_artifacts.sh` 一键拉 |
 | 基座模型 ×3 | HF `Qwen/*` | 预拉或训练首次自动下载 |
 | ALFWorld 游戏数据 | `alfworld-download` | 容器内跑一次即可 |
@@ -20,15 +20,27 @@
 - NVIDIA 驱动 ≥ 550；Docker ≥ 24 + nvidia-container-toolkit（`docker run --gpus all` 可用）
 - 能访问 huggingface.co 与 github.com（受限见 §8）
 
-## 2. 构建镜像
+## 2. 拿训练镜像
+
+先 clone 仓库，再从 Hugging Face 拉预构建包（~21GB）load 进 Docker。不必自己 `docker build`。
 
 ```bash
 git clone https://github.com/Ch1nyzzz/e2-learning.git && cd e2-learning
-docker build -f docker/Dockerfile -t e2l-train:latest .
+
+hf download erv1n/e2l-train-image --repo-type dataset --local-dir ./e2l-train-image
+cd e2l-train-image
+sha256sum -c e2l-train.tar.gz.sha256
+gunzip -c e2l-train.tar.gz | docker load   # 出现 e2l-train:latest
+cd ..
 ```
 
-构建约 1–2 小时（下载 ~40GB）。目标机完全离线时，在有网机器上
-`docker save e2l-train:latest | gzip > e2l-train.tar.gz`，传过去 `docker load < e2l-train.tar.gz`。
+下载慢或 huggingface.co 不通时：`export HF_ENDPOINT=https://hf-mirror.com` 后再跑 `hf download`。
+
+备选：自己构建（1–2 小时，需能访问 GitHub / PyPI / Docker Hub）：
+
+```bash
+docker build -f docker/Dockerfile -t e2l-train:latest .
+```
 
 镜像里有什么：
 
@@ -147,9 +159,9 @@ Qwen3 臂评测同样 nothink。回传：完整日志、两 ckpt、轨迹 JSONL 
 - `kl_loss` 第 0 步 ≠ 0 → prompt/tokenizer 配置错了，停下排查，不要硬跑。
 - vLLM 侧 OOM → `GPU_MEM_UTIL=0.5`（再不行 0.45，或 `ROLLOUT_TP=2`）。
 - Ray 冲突 → 脚本已隔离 `RAY_TMPDIR`；共享机上不要手删 `/tmp/ray*`。
-- HF 下载失败/慢 → `export HF_ENDPOINT=https://hf-mirror.com`（`hf download` 与 pull 脚本都认）。
+- HF 下载失败/慢 → `export HF_ENDPOINT=https://hf-mirror.com`（镜像包 `erv1n/e2l-train-image`、`hf download`、pull 脚本都认）。
 - wandb.ai 不可达 / `wandb: Network error` → `WANDB_MODE=offline` 先训，回头 `wandb sync wandb/`；或设 HTTP 代理。没 key 又想先跑：`LOGGER="['console']"`。
-- GitHub 不可达 → 镜像走 `docker save/load`；Dockerfile 里 `git clone langfengQ/verl-agent` 必须在有网机器完成。
+- GitHub 不可达 → 不要自己 `docker build`，用 §2 的 HF 镜像包 `docker load`；Dockerfile 里 `git clone langfengQ/verl-agent` 必须在有网机器完成。
 - 8 卡每步耗时没有明显低于 4 卡预期 → 检查 `ROLLOUT_TP=1` 是否生效（日志里 vLLM engine 数应为 8）。
 - 需要 e2-learning 自带的 stage-1 工具/离线评测（uv 环境）→ 进容器后在挂载仓库里 `uv sync --extra train --extra alfworld`。
 

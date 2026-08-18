@@ -21,3 +21,4 @@ data/
 # experiment launch/monitor logs
 runs/
 wandb/
+e2l-train-image/
