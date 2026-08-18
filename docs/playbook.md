@@ -11,20 +11,20 @@ https://github.com/Ch1nyzzz/e2-learning/blob/main/docs/playbook.md
 ## 0. 从零清单（按顺序勾）
 
 1. 宿主机：GPU + Docker + `hf` CLI（§1–§2）
-2. 下载镜像包并 `docker load`（§3）
+2. `docker pull` 或下载 tar 再 `docker load`（§3）
 3. 建工作目录，启动容器（§4）
 4. 容器内拉齐 ckpt / 数据 / 基座模型（§5）
 5. 自检（§6）
 6. 按 E5→E2→E1 开训，再 P1/P2（§7）
 7. 留 ckpt、评测、回传（§8）
 
-所有资源都是 **Hugging Face 公开仓库**，不需要 token。路径、命名空间、镜像源都可以用环境变量改。
+训练镜像在 **Docker Hub**（可 `docker pull`）。ckpt / 数据在 **Hugging Face 公开仓库**，不需要 token。路径、命名空间、镜像源都可以用环境变量改。
 
 ## 0.1 资源目录（全部可下载、可覆盖）
 
 | 资源 | 默认从哪拉 | 覆盖方式 |
 |---|---|---|
-| 训练镜像（代码+环境，~21GB 压缩 / ~47GB load 后） | 数据集 [`erv1n/e2l-train-image`](https://huggingface.co/datasets/erv1n/e2l-train-image) | `HF_ENDPOINT`；自己 `docker build` 见 §3 备选 |
+| 训练镜像（代码+环境，load 后 ~47GB） | Docker Hub [`yuhan778/e2l-train:latest`](https://hub.docker.com/r/yuhan778/e2l-train) | 国内慢：HF tar [`erv1n/e2l-train-image`](https://huggingface.co/datasets/erv1n/e2l-train-image) + `HF_ENDPOINT`；自己 `docker build` 见 §3 备选 |
 | Qwen2.5 冷启动 ckpt | [`erv1n/e2l-alfworld-qwen25-7b-coldstart`](https://huggingface.co/erv1n/e2l-alfworld-qwen25-7b-coldstart) | `HF_NAMESPACE`、`Q25_REPO`、或训练时 `MODEL_PATH=...` |
 | Qwen3 冷启动 ckpt | [`erv1n/e2l-alfworld-qwen3-8b-coldstart`](https://huggingface.co/erv1n/e2l-alfworld-qwen3-8b-coldstart) | `HF_NAMESPACE`、`Q3_REPO`、或 `MODEL_PATH=...` |
 | RWML 数据（E6 必需） | 数据集 [`erv1n/e2l-rwml-alfworld-data`](https://huggingface.co/datasets/erv1n/e2l-rwml-alfworld-data) | `HF_NAMESPACE`、`RWML_DATA_REPO`、`RWML_DATA_DIR` |
@@ -44,7 +44,7 @@ https://github.com/Ch1nyzzz/e2-learning/blob/main/docs/playbook.md
 - 单机 8 × A100 80GB（H100 同流程）。4 卡也能跑，把 §7 的 `GPUS=` 改成实际卡号，并改用 `ROLLOUT_TP=2`（不要用下面的 8 卡 `E8` 前缀）
 - 空闲磁盘 ≥ 1.5TB（镜像 ~47GB、模型与数据 ~150GB、各臂 checkpoint）
 - NVIDIA 驱动 ≥ 550；Docker ≥ 24 + [nvidia-container-toolkit](https://docs.nvidia.com/datacenter/cloud-native/container-toolkit/latest/install-guide.html)，保证 `docker run --gpus all` 可用
-- 能访问 huggingface.co（或 §0.1 的 HF 镜像站）。主路径不需要 GitHub
+- 能访问 Docker Hub（拉镜像）和 huggingface.co（或 §0.1 的 HF 镜像站，拉 ckpt/数据）。主路径不需要 GitHub
 
 自检 GPU / Docker：
 
@@ -55,7 +55,7 @@ docker run --rm --gpus all nvidia/cuda:12.4.0-base-ubuntu22.04 nvidia-smi
 
 ## 2. 宿主机：只装下载工具
 
-镜像还没 load 之前，宿主机需要 `hf` 或 `wget` 来拉 21GB 包。
+§3 走 `docker pull` 时这里可跳过。走 HF tar、以及后面拉 ckpt/数据时，宿主机需要 `hf` 或 `wget`。
 
 ```bash
 python3 -m pip install -U "huggingface_hub[cli,hf_transfer]"
@@ -68,6 +68,16 @@ export HF_HUB_ENABLE_HF_TRANSFER=1
 
 ## 3. 拿训练镜像
 
+优先 `docker pull`（平台只要填镜像网址时用这个）：
+
+```bash
+docker pull yuhan778/e2l-train:latest
+docker tag yuhan778/e2l-train:latest e2l-train:latest   # 后面命令都用这个本地 tag
+docker images e2l-train:latest                          # ~46.6GB
+```
+
+国内 Docker Hub 慢或不通时，下 HF tar 再 `docker load`（约 21GB 压缩包）：
+
 ```bash
 hf download erv1n/e2l-train-image --repo-type dataset --local-dir ./e2l-train-image
 cd e2l-train-image
@@ -77,7 +87,7 @@ cd ..
 docker images e2l-train:latest             # ~46.6GB
 ```
 
-`wget` 备选（`HF_ENDPOINT` 默认同上）：
+`wget` 拉 tar（`HF_ENDPOINT` 默认同上；国内先 `export HF_ENDPOINT=https://hf-mirror.com`）：
 
 ```bash
 BASE="${HF_ENDPOINT:-https://huggingface.co}/datasets/erv1n/e2l-train-image/resolve/main"
@@ -266,7 +276,8 @@ uv sync --extra train --extra alfworld
 - HF 下载失败/慢 → 宿主机和容器都 `export HF_ENDPOINT=https://hf-mirror.com`
 - `hf: command not found`（宿主机）→ §2 的 pip；或用 §3 `wget`
 - wandb.ai 不可达 → `WANDB_MODE=offline`；没 key 又想先跑：`LOGGER="['console']"`
-- GitHub 不可达 → 不要自己 `docker build`，用 §3 的 HF 包 `docker load`
+- GitHub 不可达 → 不要自己 `docker build`，用 §3 的 `docker pull` 或 HF tar `docker load`
+- `docker pull yuhan778/e2l-train` 慢/失败 → 国内改走 §3 的 HF tar + `HF_ENDPOINT=https://hf-mirror.com`
 - 8 卡每步没有明显快于 4 卡 → 检查 `ROLLOUT_TP=1`（日志里 vLLM engine 数应为 8）
 - `docker run` 起来却是 vLLM API 服务而不是 bash → 镜像版本旧，重新 §3 load 带代码的那一版
 - E6 报找不到 parquet → 没跑 §5 的 `pull_hf_artifacts.sh`，或没挂 `data/`
