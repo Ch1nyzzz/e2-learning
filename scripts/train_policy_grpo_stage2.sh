@@ -99,6 +99,9 @@ MAX_EPISODE_STEPS=${MAX_EPISODE_STEPS:-50}
 SAVE_FREQ=${SAVE_FREQ:-5}
 TEST_FREQ=${TEST_FREQ:-5}
 EVAL_DATASET=${EVAL_DATASET:-eval_in_distribution}
+# Full rollout dump (train + val), gzipped jsonl per collection call.
+# Set ROLLOUT_LOG_DIR=null to disable.
+ROLLOUT_LOG_DIR=${ROLLOUT_LOG_DIR:-$CKPT_ROOT/$EXPERIMENT_NAME/rollouts}
 
 for env_file in "$REPO_ROOT/.env" "$REPO_ROOT/.env.example"; do
   [[ -f "$env_file" ]] || continue
@@ -200,6 +203,7 @@ cd "$VERL_AGENT_DIR"
   env.rollout.n="$GROUP_SIZE" \
   env.resources_per_worker.num_cpus=0.1 \
   env.alfworld.eval_dataset="$EVAL_DATASET" \
+  env.rollout_log_dir="$ROLLOUT_LOG_DIR" \
   trainer.critic_warmup=0 \
   "trainer.logger=${LOGGER}" \
   trainer.project_name="$PROJECT_NAME" \

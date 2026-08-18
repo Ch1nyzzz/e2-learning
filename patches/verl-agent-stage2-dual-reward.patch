@@ -1,35 +1,3 @@
-From 559f9bdf173dfa0c289e5b8c906c2fa44cf6e4c2 Mon Sep 17 00:00:00 2001
-From: Ch1nyzzz <erv1n_chen@outlook.com>
-Date: Mon, 17 Aug 2026 15:46:03 -0400
-Subject: [PATCH] Add Stage 2 dual-reward GRPO: futile-repetition penalty for
- ALFWorld
-
-Entity-slice futile detection (FutileTracker) over TextWorld facts with
-post-execution snapshots, epistemic-predicate-tolerant no-op checks, and
-agent-position slices; per-trajectory futile_weighted threaded through the
-multi-turn rollout mirroring the invalid-action pathway; trainer-side
-apply_futile_penalty with success-rate-EMA annealed coefficient (persisted
-across resumes); gated stage2 prompt template and history-review sentence.
-All behavior is off by default (use_futile_penalty / stage2_prompt False);
-the only always-on change is requesting facts=True, consumed and dropped
-inside the env worker. Ray-free CPU integration test covers the five
-canonical futile/exempt patterns.
-
-Co-Authored-By: Claude Fable 5 <noreply@anthropic.com>
----
- agent_system/environments/env_manager.py      |  10 +-
- .../agents/environment/alfred_tw_env.py       |   6 +-
- .../environments/env_package/alfworld/envs.py |  29 +-
- .../env_package/alfworld/futile_tracker.py    | 189 +++++++++++
- agent_system/environments/prompts/alfworld.py |  20 +-
- .../multi_turn_rollout/rollout_loop.py        |  49 ++-
- tests_stage2/test_futile_tracker_cpu.py       | 320 ++++++++++++++++++
- verl/trainer/config/ppo_trainer.yaml          |   5 +
- verl/trainer/ppo/ray_trainer.py               |  85 +++++
- 9 files changed, 699 insertions(+), 14 deletions(-)
- create mode 100644 agent_system/environments/env_package/alfworld/futile_tracker.py
- create mode 100644 tests_stage2/test_futile_tracker_cpu.py
-
 diff --git a/agent_system/environments/env_manager.py b/agent_system/environments/env_manager.py
 index ab09dff..2256c9a 100644
 --- a/agent_system/environments/env_manager.py
@@ -364,10 +332,50 @@ index 6f72445..95ddf84 100644
 +)
 \ No newline at end of file
 diff --git a/agent_system/multi_turn_rollout/rollout_loop.py b/agent_system/multi_turn_rollout/rollout_loop.py
-index d79e678..fa49d41 100644
+index d79e678..b829d1d 100644
 --- a/agent_system/multi_turn_rollout/rollout_loop.py
 +++ b/agent_system/multi_turn_rollout/rollout_loop.py
-@@ -238,10 +238,11 @@ class TrajectoryCollector:
+@@ -13,6 +13,11 @@
+ # See the License for the specific language governing permissions and
+ # limitations under the License.
+ 
++import gzip
++import json
++import os
++import time
++
+ import torch
+ import numpy as np
+ from verl import DataProto
+@@ -39,6 +44,27 @@ class TrajectoryCollector:
+         self.config = config
+         self.tokenizer = tokenizer
+         self.processor = processor
++        # Full-fidelity rollout dump (train + val). Disabled when env.rollout_log_dir
++        # is unset. One gzipped jsonl per collection call; the trainer refreshes
++        # global_steps before each call so filenames sort by training progress.
++        self.rollout_log_dir = self.config.env.get('rollout_log_dir', None)
++        self.global_steps = 0
++
++    def _dump_rollout(self, phase, step_records, episode_records):
++        if not self.rollout_log_dir:
++            return
++        os.makedirs(self.rollout_log_dir, exist_ok=True)
++        fname = f"{phase}_gstep{self.global_steps:06d}_{uuid.uuid4().hex[:8]}.jsonl.gz"
++        path = os.path.join(self.rollout_log_dir, fname)
++        with gzip.open(path, 'wt', encoding='utf-8') as f:
++            header = {"type": "meta", "phase": phase, "global_step": self.global_steps,
++                      "time": time.strftime("%Y-%m-%dT%H:%M:%S%z"), "episodes": len(episode_records)}
++            f.write(json.dumps(header, ensure_ascii=False) + "\n")
++            for rec in step_records:
++                f.write(json.dumps(rec, ensure_ascii=False) + "\n")
++            for rec in episode_records:
++                f.write(json.dumps(rec, ensure_ascii=False) + "\n")
++        print(f"[rollout_recorder] wrote {len(step_records)} steps / {len(episode_records)} episodes to {path}")
+ 
+     def preprocess_single_sample(
+         self,
+@@ -238,10 +264,11 @@ class TrajectoryCollector:
              success: Dict[str, np.ndarray],
              traj_uid: np.ndarray,
              tool_callings: np.ndarray,
@@ -380,7 +388,7 @@ index d79e678..fa49d41 100644
          Parameters:
              total_batch_list (List[List[Dict]): List of trajectory data for each environment
              episode_rewards (np.ndarray): Total rewards for each environment
-@@ -249,6 +250,8 @@ class TrajectoryCollector:
+@@ -249,6 +276,8 @@ class TrajectoryCollector:
              success (Dict[str, np.ndarray]): Success samples for each environment
              traj_uid (np.ndarray): Trajectory unique identifiers
              tool_callings (np.ndarray): Number of tool callings for each environment
@@ -389,7 +397,7 @@ index d79e678..fa49d41 100644
          Returns:
              DataProto: Collected and organized trajectory data
          """
-@@ -257,9 +260,24 @@ class TrajectoryCollector:
+@@ -257,9 +286,24 @@ class TrajectoryCollector:
          success_rate = {}
          for key, value in success.items():
              success_rate[key] = np.mean(value)
@@ -414,7 +422,7 @@ index d79e678..fa49d41 100644
              # sum the rewards for each data in total_batch_list[bs]
              for data in total_batch_list[bs]:
                  assert traj_uid[bs] == data['traj_uid'], "data is not from the same trajectory"
-@@ -270,6 +288,11 @@ class TrajectoryCollector:
+@@ -270,6 +314,11 @@ class TrajectoryCollector:
                      data['episode_lengths'] = episode_lengths[bs]
                      # tool_callings
                      data['tool_callings'] = tool_callings[bs]
@@ -426,7 +434,28 @@ index d79e678..fa49d41 100644
                      # success_rate
                      for key, value in success_rate.items():
                          data[key] = value
-@@ -376,6 +399,14 @@ class TrajectoryCollector:
+@@ -284,9 +333,10 @@ class TrajectoryCollector:
+ 
+     def vanilla_multi_turn_loop(
+             self,
+-            gen_batch: DataProto, 
+-            actor_rollout_wg, 
++            gen_batch: DataProto,
++            actor_rollout_wg,
+             envs: EnvironmentManagerBase,
++            phase: str = 'train',
+             ) -> DataProto:
+         """
+         Collects trajectories through parallel agent-environment agent_loop.
+@@ -328,6 +378,7 @@ class TrajectoryCollector:
+         episode_lengths = np.zeros(batch_size, dtype=np.float32)
+         episode_rewards = np.zeros(batch_size, dtype=np.float32)
+         tool_callings = np.zeros(batch_size, dtype=np.float32)
++        step_records = []
+         # Trajectory collection loop
+         for _step in range(self.config.env.max_steps):
+             active_masks = np.logical_not(is_done)
+@@ -376,6 +427,14 @@ class TrajectoryCollector:
              else:
                  batch.non_tensor_batch['is_action_valid'] = np.ones(batch_size, dtype=bool)
  
@@ -441,7 +470,67 @@ index d79e678..fa49d41 100644
              if 'tool_calling' in infos[0]:
                  tool_callings[active_masks] += np.array([info['tool_calling'] for info in infos], dtype=np.float32)[active_masks]
              # Create reward tensor, only assign rewards for active environments
-@@ -435,11 +466,13 @@ class TrajectoryCollector:
+@@ -394,6 +453,24 @@ class TrajectoryCollector:
+                 total_batch_list[i].append(batch_list[i])
+                 total_infos[i].append(infos[i])
+ 
++            if self.rollout_log_dir and obs.get('text') is not None:
++                for i in range(batch_size):
++                    if not active_masks[i]:
++                        continue
++                    step_records.append({
++                        "type": "step",
++                        "traj_uid": traj_uid[i],
++                        "group_uid": uid_batch[i],
++                        "step": _step,
++                        "prompt": obs['text'][i],
++                        "response": text_actions[i],
++                        "reward": float(rewards[i]),
++                        "action_valid": bool(batch.non_tensor_batch['is_action_valid'][i]),
++                        "futile": bool(batch.non_tensor_batch['futile'][i]),
++                        "futile_streak": int(batch.non_tensor_batch['futile_streak'][i]),
++                        "done": bool(dones[i]),
++                    })
++
+             # Update done states
+             is_done = np.logical_or(is_done, dones)
+                 
+@@ -407,17 +484,30 @@ class TrajectoryCollector:
+         success: Dict[str, np.ndarray] = envs.success_evaluator(
+                     total_infos=total_infos,
+                     total_batch_list=total_batch_list,
+-                    episode_rewards=episode_rewards, 
++                    episode_rewards=episode_rewards,
+                     episode_lengths=episode_lengths,
+                     )
+-        
++
++        if self.rollout_log_dir:
++            won = np.asarray(success.get('success_rate', np.zeros(batch_size)))
++            episode_records = [{
++                "type": "episode",
++                "traj_uid": traj_uid[i],
++                "group_uid": uid_batch[i],
++                "episode_reward": float(episode_rewards[i]),
++                "episode_length": int(episode_lengths[i]),
++                "won": bool(won[i]) if i < len(won) else False,
++            } for i in range(batch_size)]
++            self._dump_rollout(phase, step_records, episode_records)
++
+         return total_batch_list, episode_rewards, episode_lengths, success, traj_uid, tool_callings
+     
+     def dynamic_multi_turn_loop(
+             self,
+-            gen_batch: DataProto, 
+-            actor_rollout_wg, 
++            gen_batch: DataProto,
++            actor_rollout_wg,
+             envs: EnvironmentManagerBase,
++            phase: str = 'train',
+             ) -> DataProto:
+         """
+         Conduct dynamic rollouts until a target batch size is met. 
+@@ -435,11 +525,13 @@ class TrajectoryCollector:
              total_episode_lengths (np.ndarray): Lengths per episode.
              total_success (Dict[str, np.ndarray]): Success metrics.
              total_traj_uid (np.ndarray): Trajectory IDs.
@@ -455,9 +544,11 @@ index d79e678..fa49d41 100644
          total_traj_uid = []
          total_tool_callings = []
          try_count: int = 0
-@@ -456,7 +489,10 @@ class TrajectoryCollector:
+@@ -455,8 +547,12 @@ class TrajectoryCollector:
+                 gen_batch=gen_batch,
                  actor_rollout_wg=actor_rollout_wg,
                  envs=envs,
++                phase=phase,
              )
 -            batch_list, episode_rewards, episode_lengths, success, traj_uid, tool_callings = filter_group_data(batch_list=batch_list, 
 +            # keep the unfiltered success samples: filter_group_data drops
@@ -467,7 +558,7 @@ index d79e678..fa49d41 100644
                                                                                                  episode_rewards=episode_rewards, 
                                                                                                  episode_lengths=episode_lengths, 
                                                                                                  success=success, 
-@@ -476,10 +512,11 @@ class TrajectoryCollector:
+@@ -476,10 +572,11 @@ class TrajectoryCollector:
          total_episode_rewards = np.concatenate(total_episode_rewards, axis=0)
          total_episode_lengths = np.concatenate(total_episode_lengths, axis=0)
          total_success = {key: np.concatenate([success[key] for success in total_success], axis=0) for key in total_success[0].keys()}
@@ -480,7 +571,7 @@ index d79e678..fa49d41 100644
  
      def multi_turn_loop(
              self,
-@@ -506,20 +543,21 @@ class TrajectoryCollector:
+@@ -506,20 +603,23 @@ class TrajectoryCollector:
          # Initial observations from the environment
          if self.config.algorithm.filter_groups.enable and is_train:
              # Dynamic Sampling (for DAPO and Dynamic GiGPO)
@@ -490,6 +581,7 @@ index d79e678..fa49d41 100644
                  gen_batch=gen_batch,
                  actor_rollout_wg=actor_rollout_wg,
                  envs=envs,
++                phase='train' if is_train else 'val',
              )
          else:
 -            # Vanilla Sampling   
@@ -499,12 +591,13 @@ index d79e678..fa49d41 100644
                  gen_batch=gen_batch,
                  actor_rollout_wg=actor_rollout_wg,
                  envs=envs,
++                phase='train' if is_train else 'val',
              )
 +            total_success_prefilter = total_success  # nothing filtered
          assert len(total_batch_list) == len(total_episode_rewards)
          assert len(total_batch_list) == len(total_episode_lengths)
          assert len(total_batch_list) == len(total_traj_uid)
-@@ -534,6 +572,7 @@ class TrajectoryCollector:
+@@ -534,6 +634,7 @@ class TrajectoryCollector:
              success=total_success,
              traj_uid=total_traj_uid,
              tool_callings=totoal_tool_callings,
@@ -839,7 +932,7 @@ index 0000000..5fa382e
 +if __name__ == "__main__":
 +    main()
 diff --git a/verl/trainer/config/ppo_trainer.yaml b/verl/trainer/config/ppo_trainer.yaml
-index d0f68ba..0dbf0e5 100644
+index d0f68ba..7140447 100644
 --- a/verl/trainer/config/ppo_trainer.yaml
 +++ b/verl/trainer/config/ppo_trainer.yaml
 @@ -57,6 +57,10 @@ actor_rollout_ref:
@@ -853,16 +946,17 @@ index d0f68ba..0dbf0e5 100644
      use_kl_loss: False # True for GRPO
      use_torch_compile: True # False to disable torch compile
      kl_loss_coef: 0.001 # for grpo
-@@ -294,6 +298,7 @@ env:
+@@ -294,6 +298,8 @@ env:
    seed: 0
    max_steps: 50
    history_length: 2
 +  stage2_prompt: False # stage2 template variant with a history-review sentence (read by env_manager)
++  rollout_log_dir: null # when set, dump every train/val rollout (prompt, response, rewards) as gzipped jsonl here
    resources_per_worker: # resources for each env worker
      num_cpus: 0.1
      num_gpus: 0
 diff --git a/verl/trainer/ppo/ray_trainer.py b/verl/trainer/ppo/ray_trainer.py
-index d85e23a..b436d4e 100644
+index d85e23a..d339c34 100644
 --- a/verl/trainer/ppo/ray_trainer.py
 +++ b/verl/trainer/ppo/ray_trainer.py
 @@ -223,6 +223,49 @@ def apply_invalid_action_penalty(data: DataProto, invalid_action_penalty_coef=fl
@@ -915,7 +1009,15 @@ index d85e23a..b436d4e 100644
  def compute_response_mask(data: DataProto):
      """Compute the attention mask for the response part of the sequence.
  
-@@ -935,6 +978,13 @@ class RayPPOTrainer:
+@@ -746,6 +789,7 @@ class RayPPOTrainer:
+             # test_output_gen_batch = unpad_dataproto(test_output_gen_batch_padded, pad_size=pad_size)
+ 
+             ################ agent-environment loop ###############
++            self.traj_collector.global_steps = self.global_steps
+             test_output_gen_batch = self.traj_collector.multi_turn_loop(
+                                                     gen_batch=test_gen_batch,
+                                                     actor_rollout_wg=self.actor_rollout_wg,
+@@ -935,6 +979,13 @@ class RayPPOTrainer:
          dataloader_state_dict = self.train_dataloader.state_dict()
          torch.save(dataloader_state_dict, dataloader_local_path)
  
@@ -929,7 +1031,7 @@ index d85e23a..b436d4e 100644
          # latest checkpointed iteration tracker (for atomic usage)
          local_latest_checkpointed_iteration = os.path.join(self.config.trainer.default_local_dir, "latest_checkpointed_iteration.txt")
          with open(local_latest_checkpointed_iteration, "w") as f:
-@@ -991,6 +1041,13 @@ class RayPPOTrainer:
+@@ -991,6 +1042,13 @@ class RayPPOTrainer:
          else:
              print(f"Warning: No dataloader state found at {dataloader_local_path}, will start from scratch")
  
@@ -943,7 +1045,7 @@ index d85e23a..b436d4e 100644
      def _balance_batch(self, batch: DataProto, metrics, logging_prefix="global_seqlen"):
          """Reorder the data on single controller such that each dp rank gets similar total tokens"""
          attention_mask = batch.batch["attention_mask"]
-@@ -1023,6 +1080,10 @@ class RayPPOTrainer:
+@@ -1023,6 +1081,10 @@ class RayPPOTrainer:
          )
  
          self.global_steps = 0
@@ -954,7 +1056,15 @@ index d85e23a..b436d4e 100644
  
          # load checkpoint before doing anything
          self._load_checkpoint()
-@@ -1207,6 +1268,30 @@ class RayPPOTrainer:
+@@ -1079,6 +1141,7 @@ class RayPPOTrainer:
+                         #     self.async_rollout_manager.sleep()
+ 
+                         ################ agent-environment loop ###############
++                        self.traj_collector.global_steps = self.global_steps
+                         gen_batch_output = self.traj_collector.multi_turn_loop(
+                                                                 gen_batch=gen_batch,
+                                                                 actor_rollout_wg=self.actor_rollout_wg,
+@@ -1207,6 +1270,30 @@ class RayPPOTrainer:
                                                                                    )
                              metrics.update(invalid_metrics)
  
@@ -985,6 +1095,3 @@ index d85e23a..b436d4e 100644
                          # compute rewards. apply_kl_penalty if available
                          if self.config.algorithm.use_kl_in_reward:
                              batch, kl_metrics = apply_kl_penalty(batch, kl_ctrl=self.kl_ctrl_in_reward, kl_penalty=self.config.algorithm.kl_penalty)
--- 
-2.43.0
-
