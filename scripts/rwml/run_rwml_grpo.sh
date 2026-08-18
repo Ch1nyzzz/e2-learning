@@ -10,6 +10,27 @@
 # RWML_TAU_D.
 set -euo pipefail
 cd "$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
+REPO_ROOT="$PWD"
+
+for env_file in "$REPO_ROOT/.env" "$REPO_ROOT/.env.example"; do
+  [[ -f "$env_file" ]] || continue
+  while IFS='=' read -r key value; do
+    [[ "$key" == WANDB_* ]] || continue
+    [[ -z "$value" ]] && continue
+    if [[ -z "${!key:-}" ]]; then
+      export "${key}=${value}"
+    fi
+  done < <(grep -E '^WANDB_[A-Z0-9_]+=' "$env_file" || true)
+done
+[[ -z "${WANDB_ENTITY:-}" ]] && unset WANDB_ENTITY
+export WANDB_DIR="${WANDB_DIR:-$REPO_ROOT}"
+PROJECT_NAME=${WANDB_PROJECT:-e2l_rwml}
+LOGGER=${LOGGER:-"['console','wandb']"}
+if [[ "$LOGGER" == *wandb* && -z "${WANDB_API_KEY:-}" && "${WANDB_MODE:-}" != "offline" ]]; then
+  echo "error: wandb is on but WANDB_API_KEY is empty (expected in .env.example)." >&2
+  echo "  or WANDB_MODE=offline, or LOGGER=\"['console']\" to skip." >&2
+  exit 1
+fi
 
 # Interpreter of the RWML veRL env (container images set this to the baked-in
 # venv; locally it is the repo's .venv-verl).
@@ -81,8 +102,8 @@ CUDA_VISIBLE_DEVICES="${train_gpus}" "$VERL_VENV_PYTHON" -m verl.trainer.main_pp
   custom_reward_function.path=scripts/rwml/rwml_reward.py \
   custom_reward_function.name=compute_score \
   trainer.critic_warmup=0 \
-  "trainer.logger=['console']" \
-  trainer.project_name=e2l_rwml \
+  "trainer.logger=${LOGGER}" \
+  trainer.project_name="$PROJECT_NAME" \
   trainer.experiment_name=rwml_grpo_merged10k \
   trainer.n_gpus_per_node="${n_gpus}" \
   trainer.nnodes=1 \

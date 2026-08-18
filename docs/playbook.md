@@ -12,13 +12,13 @@
 | 冷启动 ckpt ×2 + RWML 数据 | HF `erv1n/e2l-*`（public） | `scripts/pull_hf_artifacts.sh` 一键拉 |
 | 基座模型 ×3 | HF `Qwen/*` | 预拉或训练首次自动下载 |
 | ALFWorld 游戏数据 | `alfworld-download` | 容器内跑一次即可 |
-| verl-agent | 镜像内已带；非 Docker 路线跑 `scripts/setup_verl_agent.sh` | 上游 `20bd331` 原样 + 本仓库补丁（工作区 diff 形式），见 §10.2 |
+| verl-agent | 镜像内已带；非 Docker 路线跑 `scripts/setup_verl_agent.sh` | 上游 `20bd331` 原样 + 本仓库补丁（工作区 diff 形式），见 §9.2 |
 
 ## 1. 机器要求
 
 - 单机 8 × A100 80GB（H100 同流程）；空闲磁盘 ≥ 1.5TB（镜像 ~40GB、模型与数据 ~150GB、各臂 checkpoint）
 - NVIDIA 驱动 ≥ 550；Docker ≥ 24 + nvidia-container-toolkit（`docker run --gpus all` 可用）
-- 能访问 huggingface.co 与 github.com（受限见 §9）
+- 能访问 huggingface.co 与 github.com（受限见 §8）
 
 ## 2. 构建镜像
 
@@ -79,7 +79,7 @@ docker run --gpus all -it --name e2l --shm-size=64g \
 cd /workspace/e2-learning
 ```
 
-要点：仓库以挂载方式进容器（脚本改动即时生效、checkpoint 直接落宿主机盘）；HF cache 挂载避免重复下载。
+要点：仓库以挂载方式进容器（脚本改动即时生效、checkpoint 直接落宿主机盘）；HF cache 挂载避免重复下载。W&B key 已写在 `.env.example`（随仓库走），训练脚本会自动读；run 文件写在仓库 `wandb/`（已 gitignore）。
 
 ## 5. 自检（10 分钟）
 
@@ -91,25 +91,14 @@ cd /opt/verl-agent && CUDA_VISIBLE_DEVICES="" ALFWORLD_DATA=/data/alfworld \
   python3 tests_stage2/test_futile_tracker_cpu.py    # 5 个模式全 PASS
 ```
 
-## 6. 冒烟（必做）
+## 6. 正式训练（6 臂）
 
-```bash
-cd /workspace/e2-learning
-GPUS=0,1,2,3,4,5,6,7 ROLLOUT_TP=1 GPU_MEM_UTIL=0.6 \
-FSDP_PARAM_OFFLOAD=false FSDP_OPTIMIZER_OFFLOAD=false \
-ENFORCE_EAGER=false FREE_CACHE_ENGINE=false \
-MODEL_PATH=erv1n/e2l-alfworld-qwen25-7b-coldstart EXPERIMENT_NAME=smoke_stage2 \
-TRAIN_STEPS=10 SAVE_FREQ=-1 TEST_FREQ=5 \
-bash scripts/train_policy_grpo_stage2.sh 2>&1 | tee runs/smoke_stage2.log
-```
-
-通过标准（逐条核，细节见 handoff §2）：`actor/kl_loss` 第 0 步 ≈ 0；出现 `futile/coef` 等指标且 coef 从 0.25 起步；`prompt_length/max` < 4096；记录每步耗时。
-
-## 7. 正式训练（6 臂）
+W&B 默认开：项目 `e2l_policy_grpo`（E6 为 `e2l_rwml`），run 名即 `EXPERIMENT_NAME`。API key 已在 `.env.example`，clone 下来即可用。上不了 wandb.ai 时加 `WANDB_MODE=offline`，训完在仓库根目录 `wandb sync wandb/`。只要 console：`LOGGER="['console']"`。
 
 8 卡统一前缀（对齐 verl-agent 官方与 8 卡开源配置，依据见 `scripts/train_policy_grpo_stage2.sh` 头注释）：
 
 ```bash
+cd /workspace/e2-learning
 E8="GPUS=0,1,2,3,4,5,6,7 ROLLOUT_TP=1 GPU_MEM_UTIL=0.6 FSDP_PARAM_OFFLOAD=false FSDP_OPTIMIZER_OFFLOAD=false ENFORCE_EAGER=false FREE_CACHE_ENGINE=false"
 ```
 
@@ -147,25 +136,26 @@ bash scripts/rwml/run_rwml_grpo.sh
 断点续训：直接重跑同一命令（verl 自动找最新 checkpoint）。每个臂训完用
 `scripts/keep_best_grpo_ckpt.py` 的逻辑按 val 最优保留 HF checkpoint。
 
-## 8. 评测与产物回传
+## 7. 评测与产物回传
 
 评测协议与回传清单照 `docs/handoff_experiments.md` §5/§7 执行：训练内 val（自动）作选
 ckpt 依据；best-by-val 与 final 两 ckpt 做 T=0 双 split 全集（主口径）+ T=0.4×3（可比列）；
 Qwen3 臂评测同样 nothink。回传：完整日志、两 ckpt、轨迹 JSONL + summary、每步耗时。
 
-## 9. 常见故障
+## 8. 常见故障
 
 - `kl_loss` 第 0 步 ≠ 0 → prompt/tokenizer 配置错了，停下排查，不要硬跑。
 - vLLM 侧 OOM → `GPU_MEM_UTIL=0.5`（再不行 0.45，或 `ROLLOUT_TP=2`）。
 - Ray 冲突 → 脚本已隔离 `RAY_TMPDIR`；共享机上不要手删 `/tmp/ray*`。
 - HF 下载失败/慢 → `export HF_ENDPOINT=https://hf-mirror.com`（`hf download` 与 pull 脚本都认）。
+- wandb.ai 不可达 / `wandb: Network error` → `WANDB_MODE=offline` 先训，回头 `wandb sync wandb/`；或设 HTTP 代理。没 key 又想先跑：`LOGGER="['console']"`。
 - GitHub 不可达 → 镜像走 `docker save/load`；Dockerfile 里 `git clone langfengQ/verl-agent` 必须在有网机器完成。
-- 8 卡冒烟每步耗时没有明显低于 4 卡预期 → 检查 `ROLLOUT_TP=1` 是否生效（日志里 vLLM engine 数应为 8）。
+- 8 卡每步耗时没有明显低于 4 卡预期 → 检查 `ROLLOUT_TP=1` 是否生效（日志里 vLLM engine 数应为 8）。
 - 需要 e2-learning 自带的 stage-1 工具/离线评测（uv 环境）→ 进容器后在挂载仓库里 `uv sync --extra train --extra alfworld`。
 
-## 10. 附录
+## 9. 附录
 
-### 10.1 环境版本（与本机工作环境逐项对齐）
+### 9.1 环境版本（与本机工作环境逐项对齐）
 
 | 环境 | 用途 | 关键版本 |
 |---|---|---|
@@ -175,7 +165,7 @@ Qwen3 臂评测同样 nothink。回传：完整日志、两 ckpt、轨迹 JSONL 
 
 完整锁定清单：`docker/requirements-stage2.txt`、`docker/requirements-rwml.txt`。
 
-### 10.2 verl-agent 补丁机制（上游保持原样）
+### 9.2 verl-agent 补丁机制（上游保持原样）
 
 Stage 2 对 verl-agent 的改动（futile 惩罚、stage2 prompt、双奖励指标等，对应未推送的 commit
 `559f9bd`）**不维护任何 fork/分支**：`patches/verl-agent-stage2-dual-reward.patch` 是唯一载体，
@@ -195,7 +185,7 @@ git format-patch -1 --stdout > patches/verl-agent-stage2-dual-reward.patch   # �
 # 并同步 scripts/setup_verl_agent.sh 里的 STAGE2_COMMIT 值
 ```
 
-### 10.3 超参数依据
+### 9.3 超参数依据
 
 训练配方（lr 1e-6、KL 0.01 low_var_kl、16 任务 × 组内 8、150 步、val 128 局 T=0.4 每 5 步、
 无效动作惩罚 0.1）对齐 verl-agent 官方 `examples/grpo_trainer/run_alfworld.sh` 与 GiGPO 论文附录 E；

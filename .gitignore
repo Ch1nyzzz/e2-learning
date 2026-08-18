@@ -20,3 +20,4 @@ data/
 
 # experiment launch/monitor logs
 runs/
+wandb/

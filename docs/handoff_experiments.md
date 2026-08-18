@@ -1,8 +1,8 @@
 # 交接实验清单：Stage 2 双奖励 GRPO + RWML 基线
 
 > 2026-08-17 定稿。目标机器：8 × A100 80GB（≥4 × 80GB 均可，8 卡用 §2 的
-> 8-GPU 覆盖项）。所有训练用 verl-agent
-> 的 `stage2-dual-reward` 分支（commit `559f9bd`）+ 本仓库 `main`（commit `87e8560`）。
+> 8-GPU 覆盖项）。所有训练用 verl-agent = 上游 `20bd331` + 本仓库
+> `patches/verl-agent-stage2-dual-reward.patch`（对应改动 `559f9bd`）；本仓库 `main` ≥ `66f5056`。
 > 环境搭建与镜像打包按 `docs/playbook.md` 执行，本文只列实验与验收。
 > 疑问先看本文档末尾的"常见故障"，再联系 yuhan。
 

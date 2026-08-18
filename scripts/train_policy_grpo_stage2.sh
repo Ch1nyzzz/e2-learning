@@ -42,6 +42,10 @@ set -euo pipefail
 # Keep TRAIN_TASKS_PER_UPDATE=16 x GROUP_SIZE=8 (128 trajectories/update): that
 # is the paper-standard update size and preserves comparability across arms --
 # 8 GPUs buy wall-clock speed, not a larger batch.
+#
+# W&B: default logger is console+wandb. Key lives in .env.example (shared
+# with the remote machine). Offline: WANDB_MODE=offline. Disable:
+# LOGGER="['console']".
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 MODEL_PATH=${MODEL_PATH:?Set MODEL_PATH (cold-start HF checkpoint or base model)}
 EXPERIMENT_NAME=${EXPERIMENT_NAME:?Set EXPERIMENT_NAME}
@@ -95,6 +99,27 @@ MAX_EPISODE_STEPS=${MAX_EPISODE_STEPS:-50}
 SAVE_FREQ=${SAVE_FREQ:-5}
 TEST_FREQ=${TEST_FREQ:-5}
 EVAL_DATASET=${EVAL_DATASET:-eval_in_distribution}
+
+for env_file in "$REPO_ROOT/.env" "$REPO_ROOT/.env.example"; do
+  [[ -f "$env_file" ]] || continue
+  while IFS='=' read -r key value; do
+    [[ "$key" == WANDB_* ]] || continue
+    [[ -z "$value" ]] && continue
+    if [[ -z "${!key:-}" ]]; then
+      export "${key}=${value}"
+    fi
+  done < <(grep -E '^WANDB_[A-Z0-9_]+=' "$env_file" || true)
+done
+[[ -z "${WANDB_ENTITY:-}" ]] && unset WANDB_ENTITY
+# wandb files land on the mounted repo, not inside /opt/verl-agent.
+export WANDB_DIR="${WANDB_DIR:-$REPO_ROOT}"
+PROJECT_NAME=${WANDB_PROJECT:-e2l_policy_grpo}
+LOGGER=${LOGGER:-"['console','wandb']"}
+if [[ "$LOGGER" == *wandb* && -z "${WANDB_API_KEY:-}" && "${WANDB_MODE:-}" != "offline" ]]; then
+  echo "error: wandb is on but WANDB_API_KEY is empty (expected in .env.example)." >&2
+  echo "  or WANDB_MODE=offline, or LOGGER=\"['console']\" to skip." >&2
+  exit 1
+fi
 
 export ALFWORLD_DATA
 export CUDA_VISIBLE_DEVICES="$GPUS"
@@ -176,8 +201,8 @@ cd "$VERL_AGENT_DIR"
   env.resources_per_worker.num_cpus=0.1 \
   env.alfworld.eval_dataset="$EVAL_DATASET" \
   trainer.critic_warmup=0 \
-  "trainer.logger=['console']" \
-  trainer.project_name=e2l_policy_grpo \
+  "trainer.logger=${LOGGER}" \
+  trainer.project_name="$PROJECT_NAME" \
   trainer.experiment_name="$EXPERIMENT_NAME" \
   trainer.n_gpus_per_node="$N_GPUS" \
   trainer.nnodes=1 \
