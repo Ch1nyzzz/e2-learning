@@ -1,8 +1,12 @@
 # 交接实验清单：Stage 2 双奖励 GRPO + RWML 基线
 
-> 2026-08-17 定稿。目标机器：8 × A100 80GB（≥4 × 80GB 均可，8 卡用 §2 的
-> 8-GPU 覆盖项）。所有训练用 verl-agent = 上游 `20bd331` + 本仓库
-> `patches/verl-agent-stage2-dual-reward.patch`（对应改动 `559f9bd`）；本仓库 `main` ≥ `66f5056`。
+> 2026-08-17 定稿，2026-08-18 更新（rollout 全量记录 + prompt 定稿为 verl 官方模板、去掉 stage2 句）。
+> 目标机器：8 × A100 80GB（≥4 × 80GB 均可）。所有训练用 verl-agent = 上游
+> `20bd331` + 本仓库 `patches/verl-agent-stage2-dual-reward.patch`（对应本地改动
+> `559f9bd`+`810d961`+`c5bbd88`+`d3155b9`：双奖励、rollout 记录（含原始生成）、e2l prompt 诊断格式）。
+> **2026-08-18 之前旧 prompt 格式启动的任何 Stage-2 臂全部作废，必须停掉、
+> 拉新代码/新镜像后重跑**（旧 verl 模板把冷启动 ckpt 的 val 压到 0.078，
+> 且反转臂间排序，数字不可用）。
 > 环境搭建与镜像打包按 `docs/playbook.md` 执行，本文只列实验与验收。
 > 疑问先看本文档末尾的"常见故障"，再联系 yuhan。
 
@@ -12,8 +16,16 @@
 **Stage 2（experience learning RL）= GRPO 双奖励**：环境成功奖励（+10，主）+
 futile 重复惩罚（辅，连击递增、封顶、随成功率退火到 0）。惩罚判定用 TextWorld
 特权谓词做实体切片比较，只进 reward 通道，策略只看文本。所有臂共用同一
-policy prompt（含一句"先回顾历史"的中性指令）与全历史窗口（history_length=50，
-max_prompt_length=4096）。
+policy prompt 与全历史窗口（history_length=50）。
+**Prompt 格式（2026-08-18 终定）= verl-agent 官方 ALFWorld 模板原文**
+（`PROMPT_FORMAT=verl` 为脚本默认），不加任何额外指令——原设计的 stage2
+"先回顾历史"句已删除（`STAGE2_PROMPT=false` 为默认，Q3 起点 A/B 实测该句
+对 val 影响≈0）。与官方配方的唯一差异是 `history_length=50`（futile 机制
+需要全历史）。起点基线（128 局 valid_seen，T=0.4，50 步，Q2.5）：冷启动
+0.148 / base 0.227（带句版 v2 实测；无句版 v3 出分后在此更新）。诊断用的
+e2l 格式（Stage-1 同款，system+user 双消息）保留在 `PROMPT_FORMAT=e2l`，
+实测其 128 局 val 最长 prompt ≈2.9k tokens；verl 模板下 Q2.5 @4096、Q3
+@5120 亦无截断。
 
 ## 1. 前置条件（开跑前逐项核对）
 
@@ -30,20 +42,20 @@ max_prompt_length=4096）。
 
 ## 2. 第一步：训练冒烟（半天，必做）
 
-任何长训之前，先在目标机器跑 10 步小规模（8 卡机把 `GPUS` 换成
-`0,1,2,3,4,5,6,7` 并加上 §3 的 8-GPU 覆盖项）：
+任何长训之前，先在目标机器跑 10 步小规模（`launch_stage2_arm.sh` 会按臂自动
+选 8 卡 Q2.5 档位或 4 卡 Q3 档位，见 §3）：
 
 ```bash
-GPUS=0,1,2,3 MODEL_PATH=<q25_coldstart> EXPERIMENT_NAME=smoke_stage2 \
-  TRAIN_STEPS=10 SAVE_FREQ=-1 TEST_FREQ=5 \
-  bash scripts/train_policy_grpo_stage2.sh
+ARM=q25_dual EXPERIMENT_NAME=smoke_stage2 TRAIN_STEPS=10 SAVE_FREQ=-1 TEST_FREQ=5 \
+  bash scripts/launch_stage2_arm.sh
 ```
 
 冒烟通过标准（日志逐项核对）：
 
 1. `actor/kl_loss` 第 0 步 ≈ 0（模板一致性；不为 0 说明 prompt/tokenizer 配置错了，停下排查）；
 2. 出现 `futile/coef`、`futile/sr_ema`、`futile/weighted_mean`、`futile/penalty_mean` 指标，且 coef 从 0.25 起步、随 sr_ema 上升而下降；
-3. `prompt_length/max` < 4096 且 `clip_ratio` ≈ 0（全历史装得下）；
+3. `prompt_length/max` < 档位上限（Q2.5 4096 / Q3 5120）且 `clip_ratio` ≈ 0
+   （全历史装得下）；
 4. 每步时长记录下来（预估 4 卡 1500-2500s/步，用于排期）。
 
 ## 3. 训练实验（6 项）
@@ -53,29 +65,38 @@ GPUS=0,1,2,3 MODEL_PATH=<q25_coldstart> EXPERIMENT_NAME=smoke_stage2 \
 无效动作惩罚 0.1，futile 惩罚 coef 0.25 / 封顶 12 units / sr_target 0.7，
 val 每 5 步（128 局 valid_seen，T=0.4）。Qwen3 全部臂 **nothink**
 （脚本已设 `enable_thinking=False`），Qwen2.5 不受该开关影响。
-4 卡时建议 `ROLLOUT_TP=2`（脚本默认），让 vLLM 引擎落在 NVLink 对内。
-8 × A100 80GB 时按脚本头部注释的 8-GPU 覆盖项跑（对齐 verl-agent 官方与
-EP-R1 等 8 卡开源配置）：`ROLLOUT_TP=1 GPU_MEM_UTIL=0.6
-FSDP_PARAM_OFFLOAD=false FSDP_OPTIMIZER_OFFLOAD=false ENFORCE_EAGER=false
-FREE_CACHE_ENGINE=false`。更新批量保持 16 任务 × 组内 8（128 条/次），
-8 卡只换吞吐、不改训练量，各臂与 4 卡结果可比。
+**统一入口：`ARM=<臂名> bash scripts/launch_stage2_arm.sh`**，按臂自动选
+硬件档位：Q2.5 臂 = 8 卡 A100 档位（`ROLLOUT_TP=1 GPU_MEM_UTIL=0.6`、关
+FSDP offload、关 enforce_eager，对齐 verl-agent 官方与 EP-R1 等 8 卡配置）；
+Q3 臂 = 4 卡 80GB 档位（`ROLLOUT_TP=2`，NVLink 对内，默认
+`GPU_MEM_UTIL=0.6` + `PPO_MAX_TOKEN_LEN=16384`/`LOGPROB_MAX_TOKEN_LEN=32768`
+实测 H100 提速档；共享机被挤占时降回 `GPU_MEM_UTIL=0.35` 并 unset 两个
+token 预算）。更新批量保持 16 任务 × 组内 8（128 条/次），8 卡只换吞吐、
+不改训练量，各臂与 4 卡结果可比。
+所有 train/val rollout 自动全量落盘为
+`checkpoints/e2l_policy_grpo/<臂名>/rollouts/{train,val}_gstep*.jsonl.gz`
+（meta + step 行含 prompt/response/reward + episode 行；§5 的过程指标直接用它算，
+`ROLLOUT_LOG_DIR=null` 可关）。
 
-| # | 实验名 | 初始化 | 惩罚 | 命令要点 | 优先级 |
+| # | 实验名 | 初始化 | 惩罚 | 启动命令 | 优先级 |
 |---|---|---|---|---|---|
-| E5 | `q25_stage2_plain` | Q2.5 base | 关 | `USE_FUTILE_PENALTY=false MODEL_PATH=Qwen/Qwen2.5-7B-Instruct` | **P0** |
-| E2 | `q25_stage2_pure` | Q2.5 冷启动 (1200) | 关 | `USE_FUTILE_PENALTY=false` | **P0** |
-| E1 | `q25_stage2_dual` | Q2.5 冷启动 (1200) | 开 | 脚本默认 | **P0** |
-| E3 | `q3_stage2_dual` | Q3 冷启动 (6220) | 开 | 脚本默认 | P1 |
-| E4 | `q3_stage2_pure` | Q3 冷启动 (6220) | 关 | `USE_FUTILE_PENALTY=false` | P1 |
+| E5 | `q25_stage2_plain` | Q2.5 base | 关 | `ARM=q25_plain bash scripts/launch_stage2_arm.sh` | **P0** |
+| E2 | `q25_stage2_pure` | Q2.5 冷启动 (1200) | 关 | `ARM=q25_pure bash scripts/launch_stage2_arm.sh` | **P0** |
+| E1 | `q25_stage2_dual` | Q2.5 冷启动 (1200) | 开 | `ARM=q25_dual bash scripts/launch_stage2_arm.sh` | **P0** |
+| E3 | `q3_stage2_dual` | Q3 冷启动 (6220) | 开 | `ARM=q3_dual bash scripts/launch_stage2_arm.sh` | P1 |
+| E4 | `q3_stage2_pure` | Q3 冷启动 (6220) | 关 | `ARM=q3_pure bash scripts/launch_stage2_arm.sh` | P1 |
 | E6 | `rwml_grpo_merged10k` | Q2.5 base | —（RWML 奖励） | 见 §4 | P2 |
 
-精确的 6 条启动命令写在 `scripts/train_policy_grpo_stage2.sh` 顶部注释里。
+（第 6 臂 `ARM=q3_plain` = Q3 plain-from-base，P3 对照。）冷启动 ckpt 路径
+默认指向本机 `outputs/` 树，远端机器用 `Q25_COLDSTART=`/`Q3_COLDSTART=` 或
+`MODEL_PATH=erv1n/...` 覆盖。所有臂默认 `PROMPT_FORMAT=verl`、`STAGE2_PROMPT=false`。
 **三条 Qwen2.5 臂（E5→E2→E1）是最高优先级**：它们构成完整因果链
 base+RL vs 冷启动+RL vs 冷启动+RL+惩罚，一次隔离出 Stage 1 与惩罚项
 各自的净效应，是论文的核心消融。只有一台 4 卡机时按 E5→E2→E1 顺序跑；
 有多台时三条并行。
-（Q3 plain-from-base 的旧 prompt 版本已在原机器完成，无需重跑；如需新 prompt
-版本对照，按脚本注释第 6 条跑，标 P3。）
+（Q3 plain-from-base 曾在原机器用旧 verl 模板跑过一版——prompt 格式切换后
+该结果与新臂不可比，仅作历史参考；如需对照，用 `ARM=q3_plain` 重跑，标 P3。
+**同理，任何已在远端用旧格式开跑的 P1 臂都要停掉，换新 patch/镜像重跑。**）
 
 每个臂训完后运行 `scripts/keep_best_grpo_ckpt.py` 的同款逻辑（按 val 最优保
 checkpoint，HF 格式）或至少保留 val 曲线最高点与最终步两个 checkpoint。
@@ -112,6 +133,8 @@ RWML_TRAIN_GPUS=0,1,2 RWML_EMBED_GPU=3 \
    谱系的报告方式）。
 3. **模式一致**：Qwen3 的臂训练是 nothink，评测必须同样 nothink（社区一致实践，
    verl-agent 的 val 自动继承；离线 SR 评测脚本注意传相同的 chat-template 设置）。
+   训练与训练内 val 共用 verl 模板；离线 `evaluate-sr` 是 Stage-1 的 e2l
+   格式（Stage-1 格式），不存在跨格式换算。
 4. **过程指标**（比 SR 灵敏一个量级，每个 checkpoint 都算）：无效重复率
    （futile/集）、P(换动作|Nothing happens)、重访率——用轨迹 JSONL 离线算。
 

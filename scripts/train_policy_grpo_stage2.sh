@@ -70,7 +70,13 @@ USE_FUTILE_PENALTY=${USE_FUTILE_PENALTY:-true}
 FUTILE_PENALTY_COEF=${FUTILE_PENALTY_COEF:-0.25}
 FUTILE_PENALTY_CAP_UNITS=${FUTILE_PENALTY_CAP_UNITS:-12}
 FUTILE_SR_TARGET=${FUTILE_SR_TARGET:-0.7}
-STAGE2_PROMPT=${STAGE2_PROMPT:-true}
+# User decision (2026-08-18): no history-review sentence; arms train on the
+# unmodified verl-agent template (history_length still 50).
+STAGE2_PROMPT=${STAGE2_PROMPT:-false}
+# Prompt format (user decision 2026-08-18): all arms train on the verl-native
+# template. PROMPT_FORMAT=e2l keeps the Stage-1-format port available for
+# diagnostics (see docs/handoff_experiments.md for the format study).
+PROMPT_FORMAT=${PROMPT_FORMAT:-verl}
 # Stage 2 needs the full episode in context for history review, hence the long
 # history window and larger prompt budget than the stage-1 script (50/4096 vs
 # 2/2048).
@@ -200,6 +206,7 @@ cd "$VERL_AGENT_DIR"
   env.max_steps="$MAX_EPISODE_STEPS" \
   env.history_length="$HISTORY_LENGTH" \
   env.stage2_prompt="$STAGE2_PROMPT" \
+  env.prompt_format="$PROMPT_FORMAT" \
   env.rollout.n="$GROUP_SIZE" \
   env.resources_per_worker.num_cpus=0.1 \
   env.alfworld.eval_dataset="$EVAL_DATASET" \

@@ -108,6 +108,10 @@ gunzip -c e2l-train.tar.gz | docker load
 
 **不要**把宿主机 git 仓库 mount 到 `/workspace/e2-learning`，会把镜像里的代码盖掉。
 
+> 2026-08-18 起镜像已含 e2l prompt 格式与 rollout 全量记录（patch =
+> `559f9bd`+`810d961`+`c5bbd88`）。在此之前拉的镜像/建的容器一律重新
+> `docker pull`（或重下 HF tar），并停掉旧格式已开跑的臂重跑。
+
 备选：自己构建（1–2 小时，需要 GitHub / PyPI / Docker Hub）：
 
 ```bash
@@ -192,41 +196,43 @@ W&B 默认开：项目 `e2l_policy_grpo`（E6 为 `e2l_rwml`），run 名 = `EXP
 key 在镜像 `.env.example`。上不了 wandb.ai：`WANDB_MODE=offline`，训完 `wandb sync wandb/`。
 只要 console：`LOGGER="['console']"`。
 
-8 卡统一前缀（对齐 verl-agent 官方与 8 卡开源配置）：
+**统一入口 `scripts/launch_stage2_arm.sh`**：`ARM=<臂名>` 一条命令带出该臂的
+模型、惩罚开关和硬件档位（Q2.5 臂 = 8 卡 A100 档位 `ROLLOUT_TP=1
+GPU_MEM_UTIL=0.6` 关 offload；Q3 臂 = 4 卡档位 `ROLLOUT_TP=2
+GPU_MEM_UTIL=0.6` + 16384/32768 token 预算，卡被挤占时
+`GPU_MEM_UTIL=0.35` 降级）。**所有臂默认 `PROMPT_FORMAT=verl`、`STAGE2_PROMPT=false`**（2026-08-18
+终定：verl-agent 官方模板原文、不加"先回顾历史"句，仅 `history_length=50`
+与官方配方不同；e2l 格式保留作诊断选项）。2026-08-18 之前开跑的臂配置口径
+不同且无 rollout 记录，一律停掉、换新镜像重跑。每步 train/val rollout 全量落盘
+`checkpoints/e2l_policy_grpo/<臂名>/rollouts/*.jsonl.gz`。
+
+远端机器把冷启动指到 HF repo id（本机默认是 `outputs/` 本地路径）：
 
 ```bash
-E8="GPUS=0,1,2,3,4,5,6,7 ROLLOUT_TP=1 GPU_MEM_UTIL=0.6 FSDP_PARAM_OFFLOAD=false FSDP_OPTIMIZER_OFFLOAD=false ENFORCE_EAGER=false FREE_CACHE_ENGINE=false"
+Q25C="Q25_COLDSTART=erv1n/e2l-alfworld-qwen25-7b-coldstart"
+Q3C="Q3_COLDSTART=erv1n/e2l-alfworld-qwen3-8b-coldstart"
 ```
 
 **P0，单机串行 E5→E2→E1**（论文核心消融）。每个臂另开一个 `docker exec` 跑 keep_best（见 §8），日志用 `tee`：
 
 ```bash
 # E5 plain-from-base
-env $E8 MODEL_PATH=Qwen/Qwen2.5-7B-Instruct EXPERIMENT_NAME=q25_stage2_plain \
-  USE_FUTILE_PENALTY=false bash scripts/train_policy_grpo_stage2.sh \
-  2>&1 | tee runs/q25_stage2_plain.log
+ARM=q25_plain bash scripts/launch_stage2_arm.sh 2>&1 | tee runs/q25_stage2_plain.log
 
 # E2 冷启动、无惩罚
-env $E8 MODEL_PATH=erv1n/e2l-alfworld-qwen25-7b-coldstart EXPERIMENT_NAME=q25_stage2_pure \
-  USE_FUTILE_PENALTY=false bash scripts/train_policy_grpo_stage2.sh \
-  2>&1 | tee runs/q25_stage2_pure.log
+env $Q25C ARM=q25_pure bash scripts/launch_stage2_arm.sh 2>&1 | tee runs/q25_stage2_pure.log
 
 # E1 冷启动 + futile 惩罚（主臂）
-env $E8 MODEL_PATH=erv1n/e2l-alfworld-qwen25-7b-coldstart EXPERIMENT_NAME=q25_stage2_dual \
-  bash scripts/train_policy_grpo_stage2.sh \
-  2>&1 | tee runs/q25_stage2_dual.log
+env $Q25C ARM=q25_dual bash scripts/launch_stage2_arm.sh 2>&1 | tee runs/q25_stage2_dual.log
 ```
 
-Qwen3 两臂（P1；nothink 由脚本内置）：
+Qwen3 两臂（P1；nothink 由脚本内置。8 卡机上也可给 Q3 臂加
+`GPUS=0,1,2,3,4,5,6,7 ROLLOUT_TP=1` 覆盖）：
 
 ```bash
-env $E8 MODEL_PATH=erv1n/e2l-alfworld-qwen3-8b-coldstart EXPERIMENT_NAME=q3_stage2_dual \
-  bash scripts/train_policy_grpo_stage2.sh \
-  2>&1 | tee runs/q3_stage2_dual.log
+env $Q3C ARM=q3_dual bash scripts/launch_stage2_arm.sh 2>&1 | tee runs/q3_stage2_dual.log
 
-env $E8 MODEL_PATH=erv1n/e2l-alfworld-qwen3-8b-coldstart EXPERIMENT_NAME=q3_stage2_pure \
-  USE_FUTILE_PENALTY=false bash scripts/train_policy_grpo_stage2.sh \
-  2>&1 | tee runs/q3_stage2_pure.log
+env $Q3C ARM=q3_pure bash scripts/launch_stage2_arm.sh 2>&1 | tee runs/q3_stage2_pure.log
 ```
 
 E6 RWML 基线（P2，自动用 env B；§5 的 parquet 必须已在）：
@@ -240,7 +246,7 @@ bash scripts/rwml/run_rwml_grpo.sh \
 
 断点续训：同样命令再跑一次（verl 会找最新 checkpoint）。
 
-常用覆盖（不改脚本）：`GPUS`、`MODEL_PATH`、`EXPERIMENT_NAME`、`TRAIN_STEPS`、`CKPT_ROOT`、`ALFWORLD_DATA`、`LOGGER`、`WANDB_*`；E6 还有 `RWML_TRAIN_PARQUET`、`RWML_VAL_PARQUET`、`RWML_MODEL_PATH`、`RWML_OUTPUT_DIR`、`RWML_TAU_D`。
+常用覆盖（不改脚本）：`GPUS`、`MODEL_PATH`、`EXPERIMENT_NAME`、`TRAIN_STEPS`、`CKPT_ROOT`、`ALFWORLD_DATA`、`LOGGER`、`WANDB_*`、`PROMPT_FORMAT`（默认 e2l，`verl` 回旧模板）、`ROLLOUT_LOG_DIR`（默认开，`null` 关）；E6 还有 `RWML_TRAIN_PARQUET`、`RWML_VAL_PARQUET`、`RWML_MODEL_PATH`、`RWML_OUTPUT_DIR`、`RWML_TAU_D`。
 
 ## 8. 留 ckpt、评测、回传
 
@@ -308,7 +314,8 @@ uv pip install --python .venv-verl/bin/python -r docker/requirements-rwml.txt
 
 ### 10.3 verl-agent 补丁机制（上游保持原样）
 
-Stage 2 改动（对应未推送的 `559f9bd`）**不维护 fork**：`patches/verl-agent-stage2-dual-reward.patch` 是唯一载体，`scripts/setup_verl_agent.sh` 以未提交工作区 diff 打到上游 `20bd331`。Docker 构建与手工安装走同一脚本。
+Stage 2 改动（对应未推送的本地提交 `559f9bd`（双奖励）+ `810d961`（rollout
+全量记录）+ `c5bbd88`（e2l 诊断格式）+ `d3155b9`（记录原始生成））**不维护 fork**：`patches/verl-agent-stage2-dual-reward.patch` 是唯一载体，`scripts/setup_verl_agent.sh` 以未提交工作区 diff 打到上游 `20bd331`。Docker 构建与手工安装走同一脚本。
 
 ### 10.4 超参数依据
 

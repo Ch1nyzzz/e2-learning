@@ -17,7 +17,8 @@ set -euo pipefail
 #     plain = base model, no penalty     (E5)
 #     pure  = cold-start ckpt, no penalty (E2)
 #     dual  = cold-start ckpt + futile penalty (E1)
-#   All arms use the stage2 prompt and history_length=50.
+#   All arms use the unmodified verl template with history_length=50 (the
+#   stage2 history-review sentence was dropped, 2026-08-18).
 #
 # Overridable: GPUS, EXPERIMENT_NAME, Q25_COLDSTART, Q3_COLDSTART, plus
 # everything train_policy_grpo_stage2.sh accepts. Defaults for the cold-start
@@ -73,6 +74,10 @@ fi
 
 EXPERIMENT_NAME=${EXPERIMENT_NAME:-${family}_stage2_${ARM##*_}}
 
+# All six arms train on the verl-native template (user decision 2026-08-18);
+# PROMPT_FORMAT=e2l keeps the Stage-1-format port available for diagnostics.
+PROMPT_FORMAT=${PROMPT_FORMAT:-verl}
+
 # Checkpoints saved by the stage-1 online pipeline carry an
 # 'extra_special_tokens' list that newer transformers rejects
 # (AttributeError: 'list' object has no attribute 'keys'). Rename it to the
@@ -108,4 +113,5 @@ MAX_PROMPT_LENGTH="$MAX_PROMPT_LENGTH" \
 PPO_MAX_TOKEN_LEN="${PPO_MAX_TOKEN_LEN:-}" \
 LOGPROB_MAX_TOKEN_LEN="${LOGPROB_MAX_TOKEN_LEN:-}" \
 USE_FUTILE_PENALTY="$USE_FUTILE_PENALTY" \
+PROMPT_FORMAT="$PROMPT_FORMAT" \
 exec bash "$REPO_ROOT/scripts/train_policy_grpo_stage2.sh" "$@"

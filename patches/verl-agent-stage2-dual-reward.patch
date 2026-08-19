@@ -1,10 +1,45 @@
 diff --git a/agent_system/environments/env_manager.py b/agent_system/environments/env_manager.py
-index ab09dff..2256c9a 100644
+index ab09dff..b3d1cbe 100644
 --- a/agent_system/environments/env_manager.py
 +++ b/agent_system/environments/env_manager.py
-@@ -182,23 +182,27 @@ class AlfWorldEnvironmentManager(EnvironmentManagerBase):
+@@ -177,28 +177,62 @@ class AlfWorldEnvironmentManager(EnvironmentManagerBase):
+                 raise ValueError("Task description not found in text observation.")
+         
+ 
++    def _build_e2l_text_obs(self, text_obs: List[str], admissible_actions: List[List[str]]) -> List[str]:
++        """e2l format (env.prompt_format=e2l): user-message content only; the system
++        prompt is attached by the trajectory collector. Mirrors e2-learning's
++        render_transcript + filter_actions (sorted, deduped, 'help' dropped)."""
++        postprocess_text_obs = []
++        history_length = self.config.env.history_length
++        for i in range(len(text_obs)):
++            # memory records are (observation_before, action); the observation that
++            # resulted from record j is record j+1's text_obs, or the current obs
++            # for the newest record. Record 0's text_obs is the reset observation.
++            records = self.memory[i]
++            initial_observation = records[0]['text_obs'] if records else text_obs[i]
++            steps = [
++                (rec['action'],
++                 records[j + 1]['text_obs'] if j + 1 < len(records) else text_obs[i])
++                for j, rec in enumerate(records)
++            ]
++            window = steps[-history_length:] if history_length > 0 else []
++            actions = sorted(
++                {a for a in admissible_actions[i] if a.strip().lower() != 'help'},
++                key=lambda value: value.lower(),
++            )
++            postprocess_text_obs.append(
++                alfworld_e2l_user_prompt(initial_observation, window, actions)
++            )
++        return postprocess_text_obs
++
+     def build_text_obs(self, text_obs: List[str], admissible_actions: List[List[str]], init: bool = False) -> List[str]:
+         """
          This function builds the text observation for the agent.
          """
++        # prompt_format may be absent from older configs; .get keeps default behavior
++        if self.config.env.get('prompt_format', 'verl') == 'e2l':
++            return self._build_e2l_text_obs(text_obs, admissible_actions)
          postprocess_text_obs = []
 +        # stage2_prompt may be absent from older configs; .get keeps default behavior
 +        use_stage2 = bool(self.config.env.get('stage2_prompt', False))
@@ -302,10 +337,10 @@ index 0000000..502891a
 +        diff = cls._fact_keys(pre_facts) ^ cls._fact_keys(post_facts)
 +        return all(key[0] in cls.EPISTEMIC_PREDICATES for key in diff)
 diff --git a/agent_system/environments/prompts/alfworld.py b/agent_system/environments/prompts/alfworld.py
-index 6f72445..95ddf84 100644
+index 6f72445..8141bc7 100644
 --- a/agent_system/environments/prompts/alfworld.py
 +++ b/agent_system/environments/prompts/alfworld.py
-@@ -33,4 +33,22 @@ Your admissible actions of the current situation are: [{admissible_actions}].
+@@ -33,4 +33,53 @@ Your admissible actions of the current situation are: [{admissible_actions}].
  Now it's your turn to take an action.
  You should first reason step-by-step about the current situation. This reasoning process MUST be enclosed within <think> </think> tags. 
  Once you've finished your reasoning, you should choose an admissible action for current step and present it within <action> </action> tags.
@@ -330,9 +365,40 @@ index 6f72445..95ddf84 100644
 +    "You should first reason step-by-step about the current situation.",
 +    "You should first reason step-by-step about the current situation. " + _STAGE2_HISTORY_SENTENCE,
 +)
++
++# --------------------- ALFWorld e2l format (env.prompt_format=e2l) --------------------- #
++# Verbatim port of the e2-learning Stage-1 policy prompt
++# (src/experience_learning/prompts.py: POLICY_SYSTEM_PROMPT + policy_messages).
++# Rendered as a system+user message pair so apply_chat_template produces the exact
++# structure the cold-start checkpoints were trained and offline-evaluated on.
++ALFWORLD_E2L_SYSTEM_PROMPT = """You are an agent solving a household task in the deterministic
++ALFWorld text environment. Use the task, observations, and action history to make progress toward
++the goal. Choose exactly one command from the supplied admissible actions. Briefly reason inside
++<think>...</think>, then return the command verbatim inside <action>...</action>. Do not predict the
++next observation and do not return more than one action."""
++
++ALFWORLD_E2L_SYSTEM_PROMPT_STAGE2 = ALFWORLD_E2L_SYSTEM_PROMPT + " " + _STAGE2_HISTORY_SENTENCE
++
++
++def alfworld_e2l_user_prompt(initial_observation, history_steps, admissible_actions):
++    """Render the e2l user message: render_transcript layout + admissible action list.
++
++    history_steps: (action, resulting_observation) pairs, window already applied;
++    step numbers restart at 1 within the window, matching e2-learning's
++    render_transcript over a truncated history.
++    """
++    parts = [f"INITIAL OBSERVATION:\n{initial_observation}"]
++    for index, (action, observation) in enumerate(history_steps, start=1):
++        parts.append(f"STEP {index}\nACTION: {action}\nOBSERVATION: {observation}")
++    transcript = "\n\n".join(parts)
++    action_list = "\n".join(f"- {action}" for action in admissible_actions)
++    return (
++        f"{transcript}\n\nADMISSIBLE ACTIONS:\n{action_list}\n\n"
++        "Select the single best next action."
++    )
 \ No newline at end of file
 diff --git a/agent_system/multi_turn_rollout/rollout_loop.py b/agent_system/multi_turn_rollout/rollout_loop.py
-index d79e678..b829d1d 100644
+index d79e678..a25ac48 100644
 --- a/agent_system/multi_turn_rollout/rollout_loop.py
 +++ b/agent_system/multi_turn_rollout/rollout_loop.py
 @@ -13,6 +13,11 @@
@@ -347,7 +413,7 @@ index d79e678..b829d1d 100644
  import torch
  import numpy as np
  from verl import DataProto
-@@ -39,6 +44,27 @@ class TrajectoryCollector:
+@@ -39,6 +44,42 @@ class TrajectoryCollector:
          self.config = config
          self.tokenizer = tokenizer
          self.processor = processor
@@ -356,6 +422,21 @@ index d79e678..b829d1d 100644
 +        # global_steps before each call so filenames sort by training progress.
 +        self.rollout_log_dir = self.config.env.get('rollout_log_dir', None)
 +        self.global_steps = 0
++        # e2l prompt format (env.prompt_format=e2l): env managers emit user-message
++        # content only; the collector supplies the matching system prompt so the
++        # chat structure equals e2-learning Stage-1 training/eval (system + user).
++        self.prompt_format = self.config.env.get('prompt_format', 'verl')
++        self.e2l_system_prompt = None
++        if self.prompt_format == 'e2l':
++            from agent_system.environments.prompts import (
++                ALFWORLD_E2L_SYSTEM_PROMPT,
++                ALFWORLD_E2L_SYSTEM_PROMPT_STAGE2,
++            )
++            self.e2l_system_prompt = (
++                ALFWORLD_E2L_SYSTEM_PROMPT_STAGE2
++                if self.config.env.get('stage2_prompt', False)
++                else ALFWORLD_E2L_SYSTEM_PROMPT
++            )
 +
 +    def _dump_rollout(self, phase, step_records, episode_records):
 +        if not self.rollout_log_dir:
@@ -375,7 +456,28 @@ index d79e678..b829d1d 100644
  
      def preprocess_single_sample(
          self,
-@@ -238,10 +264,11 @@ class TrajectoryCollector:
+@@ -87,10 +128,16 @@ class TrajectoryCollector:
+             print(f"Warning: No text observation found!")
+ 
+         
+-        chat = np.array([{
+-            "content": obs_content,
+-            "role": "user",
+-        }])
++        if self.e2l_system_prompt is not None:
++            chat = np.array([
++                {"content": self.e2l_system_prompt, "role": "system"},
++                {"content": obs_content, "role": "user"},
++            ])
++        else:
++            chat = np.array([{
++                "content": obs_content,
++                "role": "user",
++            }])
+         
+         # Apply chat template
+         prompt_with_chat_template = self.tokenizer.apply_chat_template(
+@@ -238,10 +285,11 @@ class TrajectoryCollector:
              success: Dict[str, np.ndarray],
              traj_uid: np.ndarray,
              tool_callings: np.ndarray,
@@ -388,7 +490,7 @@ index d79e678..b829d1d 100644
          Parameters:
              total_batch_list (List[List[Dict]): List of trajectory data for each environment
              episode_rewards (np.ndarray): Total rewards for each environment
-@@ -249,6 +276,8 @@ class TrajectoryCollector:
+@@ -249,6 +297,8 @@ class TrajectoryCollector:
              success (Dict[str, np.ndarray]): Success samples for each environment
              traj_uid (np.ndarray): Trajectory unique identifiers
              tool_callings (np.ndarray): Number of tool callings for each environment
@@ -397,7 +499,7 @@ index d79e678..b829d1d 100644
          Returns:
              DataProto: Collected and organized trajectory data
          """
-@@ -257,9 +286,24 @@ class TrajectoryCollector:
+@@ -257,9 +307,24 @@ class TrajectoryCollector:
          success_rate = {}
          for key, value in success.items():
              success_rate[key] = np.mean(value)
@@ -422,7 +524,7 @@ index d79e678..b829d1d 100644
              # sum the rewards for each data in total_batch_list[bs]
              for data in total_batch_list[bs]:
                  assert traj_uid[bs] == data['traj_uid'], "data is not from the same trajectory"
-@@ -270,6 +314,11 @@ class TrajectoryCollector:
+@@ -270,6 +335,11 @@ class TrajectoryCollector:
                      data['episode_lengths'] = episode_lengths[bs]
                      # tool_callings
                      data['tool_callings'] = tool_callings[bs]
@@ -434,7 +536,7 @@ index d79e678..b829d1d 100644
                      # success_rate
                      for key, value in success_rate.items():
                          data[key] = value
-@@ -284,9 +333,10 @@ class TrajectoryCollector:
+@@ -284,9 +354,10 @@ class TrajectoryCollector:
  
      def vanilla_multi_turn_loop(
              self,
@@ -447,7 +549,7 @@ index d79e678..b829d1d 100644
              ) -> DataProto:
          """
          Collects trajectories through parallel agent-environment agent_loop.
-@@ -328,6 +378,7 @@ class TrajectoryCollector:
+@@ -328,6 +399,7 @@ class TrajectoryCollector:
          episode_lengths = np.zeros(batch_size, dtype=np.float32)
          episode_rewards = np.zeros(batch_size, dtype=np.float32)
          tool_callings = np.zeros(batch_size, dtype=np.float32)
@@ -455,7 +557,19 @@ index d79e678..b829d1d 100644
          # Trajectory collection loop
          for _step in range(self.config.env.max_steps):
              active_masks = np.logical_not(is_done)
-@@ -376,6 +427,14 @@ class TrajectoryCollector:
+@@ -361,7 +433,10 @@ class TrajectoryCollector:
+             batch = batch.union(batch_output)
+             
+             text_actions = self.tokenizer.batch_decode(batch.batch['responses'], skip_special_tokens=True)
+-            
++            # envs.step's action projection mutates text_actions in place; keep the
++            # raw generations so the rollout dump preserves reasoning text.
++            raw_responses = list(text_actions)
++
+             next_obs, rewards, dones, infos = envs.step(text_actions)
+ 
+             
+@@ -376,6 +451,14 @@ class TrajectoryCollector:
              else:
                  batch.non_tensor_batch['is_action_valid'] = np.ones(batch_size, dtype=bool)
  
@@ -470,7 +584,7 @@ index d79e678..b829d1d 100644
              if 'tool_calling' in infos[0]:
                  tool_callings[active_masks] += np.array([info['tool_calling'] for info in infos], dtype=np.float32)[active_masks]
              # Create reward tensor, only assign rewards for active environments
-@@ -394,6 +453,24 @@ class TrajectoryCollector:
+@@ -394,6 +477,26 @@ class TrajectoryCollector:
                  total_batch_list[i].append(batch_list[i])
                  total_infos[i].append(infos[i])
  
@@ -483,8 +597,10 @@ index d79e678..b829d1d 100644
 +                        "traj_uid": traj_uid[i],
 +                        "group_uid": uid_batch[i],
 +                        "step": _step,
-+                        "prompt": obs['text'][i],
-+                        "response": text_actions[i],
++                        "prompt": (obs['text'][i] if self.e2l_system_prompt is None
++                                   else f"{self.e2l_system_prompt}\n\n{obs['text'][i]}"),
++                        "response": raw_responses[i],
++                        "action": text_actions[i],
 +                        "reward": float(rewards[i]),
 +                        "action_valid": bool(batch.non_tensor_batch['is_action_valid'][i]),
 +                        "futile": bool(batch.non_tensor_batch['futile'][i]),
@@ -495,7 +611,7 @@ index d79e678..b829d1d 100644
              # Update done states
              is_done = np.logical_or(is_done, dones)
                  
-@@ -407,17 +484,30 @@ class TrajectoryCollector:
+@@ -407,17 +510,30 @@ class TrajectoryCollector:
          success: Dict[str, np.ndarray] = envs.success_evaluator(
                      total_infos=total_infos,
                      total_batch_list=total_batch_list,
@@ -530,7 +646,7 @@ index d79e678..b829d1d 100644
              ) -> DataProto:
          """
          Conduct dynamic rollouts until a target batch size is met. 
-@@ -435,11 +525,13 @@ class TrajectoryCollector:
+@@ -435,11 +551,13 @@ class TrajectoryCollector:
              total_episode_lengths (np.ndarray): Lengths per episode.
              total_success (Dict[str, np.ndarray]): Success metrics.
              total_traj_uid (np.ndarray): Trajectory IDs.
@@ -544,7 +660,7 @@ index d79e678..b829d1d 100644
          total_traj_uid = []
          total_tool_callings = []
          try_count: int = 0
-@@ -455,8 +547,12 @@ class TrajectoryCollector:
+@@ -455,8 +573,12 @@ class TrajectoryCollector:
                  gen_batch=gen_batch,
                  actor_rollout_wg=actor_rollout_wg,
                  envs=envs,
@@ -558,7 +674,7 @@ index d79e678..b829d1d 100644
                                                                                                  episode_rewards=episode_rewards, 
                                                                                                  episode_lengths=episode_lengths, 
                                                                                                  success=success, 
-@@ -476,10 +572,11 @@ class TrajectoryCollector:
+@@ -476,10 +598,11 @@ class TrajectoryCollector:
          total_episode_rewards = np.concatenate(total_episode_rewards, axis=0)
          total_episode_lengths = np.concatenate(total_episode_lengths, axis=0)
          total_success = {key: np.concatenate([success[key] for success in total_success], axis=0) for key in total_success[0].keys()}
@@ -571,7 +687,7 @@ index d79e678..b829d1d 100644
  
      def multi_turn_loop(
              self,
-@@ -506,20 +603,23 @@ class TrajectoryCollector:
+@@ -506,20 +629,23 @@ class TrajectoryCollector:
          # Initial observations from the environment
          if self.config.algorithm.filter_groups.enable and is_train:
              # Dynamic Sampling (for DAPO and Dynamic GiGPO)
@@ -597,7 +713,7 @@ index d79e678..b829d1d 100644
          assert len(total_batch_list) == len(total_episode_rewards)
          assert len(total_batch_list) == len(total_episode_lengths)
          assert len(total_batch_list) == len(total_traj_uid)
-@@ -534,6 +634,7 @@ class TrajectoryCollector:
+@@ -534,6 +660,7 @@ class TrajectoryCollector:
              success=total_success,
              traj_uid=total_traj_uid,
              tool_callings=totoal_tool_callings,
@@ -932,7 +1048,7 @@ index 0000000..5fa382e
 +if __name__ == "__main__":
 +    main()
 diff --git a/verl/trainer/config/ppo_trainer.yaml b/verl/trainer/config/ppo_trainer.yaml
-index d0f68ba..7140447 100644
+index d0f68ba..39b7e93 100644
 --- a/verl/trainer/config/ppo_trainer.yaml
 +++ b/verl/trainer/config/ppo_trainer.yaml
 @@ -57,6 +57,10 @@ actor_rollout_ref:
@@ -946,10 +1062,11 @@ index d0f68ba..7140447 100644
      use_kl_loss: False # True for GRPO
      use_torch_compile: True # False to disable torch compile
      kl_loss_coef: 0.001 # for grpo
-@@ -294,6 +298,8 @@ env:
+@@ -294,6 +298,9 @@ env:
    seed: 0
    max_steps: 50
    history_length: 2
++  prompt_format: verl # verl = original templates; e2l = e2-learning Stage-1 system+user format (ALFWorld only)
 +  stage2_prompt: False # stage2 template variant with a history-review sentence (read by env_manager)
 +  rollout_log_dir: null # when set, dump every train/val rollout (prompt, response, rewards) as gzipped jsonl here
    resources_per_worker: # resources for each env worker
