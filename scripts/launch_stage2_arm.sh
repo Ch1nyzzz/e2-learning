@@ -14,11 +14,15 @@ set -euo pipefail
 # Usage:
 #   ARM=q25_dual bash scripts/launch_stage2_arm.sh [extra hydra overrides]
 #   ARM one of: q25_plain q25_pure q25_dual q3_plain q3_pure q3_dual
+#               q25_hint_plain q25_hint_dual
 #     plain = base model, no penalty     (E5)
 #     pure  = cold-start ckpt, no penalty (E2)
 #     dual  = cold-start ckpt + futile penalty (E1)
-#   All arms use the unmodified verl template with history_length=50 (the
-#   stage2 history-review sentence was dropped, 2026-08-18).
+#     hint_plain / hint_dual = base model WITH the history-review sentence
+#       (E7/E8; the sentence is worth +0.10 to base at step 0 -- these arms
+#       measure RL on top of that instruction bonus, without/with penalty)
+#   Default arms use the unmodified verl template with history_length=50 (the
+#   stage2 history-review sentence was dropped for them, 2026-08-18).
 #
 # Overridable: GPUS, EXPERIMENT_NAME, Q25_COLDSTART, Q3_COLDSTART, plus
 # everything train_policy_grpo_stage2.sh accepts. Defaults for the cold-start
@@ -38,6 +42,8 @@ case "$ARM" in
   q3_plain)  MODEL_PATH=${MODEL_PATH:-Qwen/Qwen3-8B};            USE_FUTILE_PENALTY=false; family=q3 ;;
   q3_pure)   MODEL_PATH=${MODEL_PATH:-$Q3_COLDSTART};            USE_FUTILE_PENALTY=false; family=q3 ;;
   q3_dual)   MODEL_PATH=${MODEL_PATH:-$Q3_COLDSTART};            USE_FUTILE_PENALTY=true;  family=q3 ;;
+  q25_hint_plain) MODEL_PATH=${MODEL_PATH:-Qwen/Qwen2.5-7B-Instruct}; USE_FUTILE_PENALTY=false; family=q25; STAGE2_PROMPT=true; ARM_EXP=q25_stage2_plain_hint ;;
+  q25_hint_dual)  MODEL_PATH=${MODEL_PATH:-Qwen/Qwen2.5-7B-Instruct}; USE_FUTILE_PENALTY=true;  family=q25; STAGE2_PROMPT=true; ARM_EXP=q25_stage2_dual_hint ;;
   *) echo "error: unknown ARM=$ARM" >&2; exit 1 ;;
 esac
 
@@ -72,7 +78,8 @@ else
   MAX_PROMPT_LENGTH=${MAX_PROMPT_LENGTH:-5120}
 fi
 
-EXPERIMENT_NAME=${EXPERIMENT_NAME:-${family}_stage2_${ARM##*_}}
+EXPERIMENT_NAME=${EXPERIMENT_NAME:-${ARM_EXP:-${family}_stage2_${ARM##*_}}}
+STAGE2_PROMPT=${STAGE2_PROMPT:-false}
 
 # All six arms train on the verl-native template (user decision 2026-08-18);
 # PROMPT_FORMAT=e2l keeps the Stage-1-format port available for diagnostics.
@@ -113,5 +120,6 @@ MAX_PROMPT_LENGTH="$MAX_PROMPT_LENGTH" \
 PPO_MAX_TOKEN_LEN="${PPO_MAX_TOKEN_LEN:-}" \
 LOGPROB_MAX_TOKEN_LEN="${LOGPROB_MAX_TOKEN_LEN:-}" \
 USE_FUTILE_PENALTY="$USE_FUTILE_PENALTY" \
+STAGE2_PROMPT="$STAGE2_PROMPT" \
 PROMPT_FORMAT="$PROMPT_FORMAT" \
 exec bash "$REPO_ROOT/scripts/train_policy_grpo_stage2.sh" "$@"

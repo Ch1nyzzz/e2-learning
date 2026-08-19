@@ -85,11 +85,19 @@ token 预算）。更新批量保持 16 任务 × 组内 8（128 条/次），8 
 | E5 | `q25_stage2_plain` | Q2.5 base | 关 | `ARM=q25_plain bash scripts/launch_stage2_arm.sh` | **P0** |
 | E2 | `q25_stage2_pure` | Q2.5 冷启动 (1200) | 关 | `ARM=q25_pure bash scripts/launch_stage2_arm.sh` | **P0** |
 | E1 | `q25_stage2_dual` | Q2.5 冷启动 (1200) | 开 | `ARM=q25_dual bash scripts/launch_stage2_arm.sh` | **P0** |
+| E7 | `q25_stage2_plain_hint` | Q2.5 base + 回顾句 | 关 | `ARM=q25_hint_plain bash scripts/launch_stage2_arm.sh` | **P0.5** |
+| E8 | `q25_stage2_dual_hint` | Q2.5 base + 回顾句 | 开 | `ARM=q25_hint_dual bash scripts/launch_stage2_arm.sh` | **P0.5** |
 | E3 | `q3_stage2_dual` | Q3 冷启动 (6220) | 开 | `ARM=q3_dual bash scripts/launch_stage2_arm.sh` | P1 |
 | E4 | `q3_stage2_pure` | Q3 冷启动 (6220) | 关 | `ARM=q3_pure bash scripts/launch_stage2_arm.sh` | P1 |
 | E6 | `rwml_grpo_merged10k` | Q2.5 base | —（RWML 奖励） | 见 §4 | P2 |
 
-（第 6 臂 `ARM=q3_plain` = Q3 plain-from-base，P3 对照。）冷启动 ckpt 路径
+（第 6 臂 `ARM=q3_plain` = Q3 plain-from-base，P3 对照。）
+E7/E8（2026-08-18 新增）：base 模型带 stage2 "回顾历史"句的两个臂。该句对
+base 起点值 +0.10（0.125→0.227，机制是诱发长复盘、带来 30+ 步游荡式晚胜，
+代价 46% 步撞 512 响应上限），对冷启动无影响。E7 测"指令红利之上纯 GRPO
+还能涨多少"，E8 测 futile 惩罚与该指令的相互作用；与 E5（无句 base）对照可
+分离"指令 vs RL vs 惩罚"三者贡献。起点基线：E7/E8 = 0.227（v2 实测），
+E5 = 0.125。冷启动 ckpt 路径
 默认指向本机 `outputs/` 树，远端机器用 `Q25_COLDSTART=`/`Q3_COLDSTART=` 或
 `MODEL_PATH=erv1n/...` 覆盖。所有臂默认 `PROMPT_FORMAT=verl`、`STAGE2_PROMPT=false`。
 **三条 Qwen2.5 臂（E5→E2→E1）是最高优先级**：它们构成完整因果链
