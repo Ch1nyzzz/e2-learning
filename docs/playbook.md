@@ -71,7 +71,8 @@ export HF_HUB_ENABLE_HF_TRANSFER=1
 优先 `docker pull`（平台只要填镜像网址时用这个）：
 
 ```bash
-docker pull yuhan778/e2l-train:latest
+docker pull yuhan778/e2l-train:latest        # = :20260818c，仓库 e70c182
+# digest 应为 sha256:02d2cfb28e88e631f16f6fce927536b8bd1b69c3de4c0172c21b39afe0a52ee4
 docker tag yuhan778/e2l-train:latest e2l-train:latest   # 后面命令都用这个本地 tag
 docker images e2l-train:latest                          # ~46.6GB
 ```
@@ -224,6 +225,10 @@ env $Q25C ARM=q25_pure bash scripts/launch_stage2_arm.sh 2>&1 | tee runs/q25_sta
 
 # E1 冷启动 + futile 惩罚（主臂）
 env $Q25C ARM=q25_dual bash scripts/launch_stage2_arm.sh 2>&1 | tee runs/q25_stage2_dual.log
+
+# E7/E8（P0.5）：base + "回顾历史"句（该句使 base 起点 0.125→0.227），无/有惩罚
+ARM=q25_hint_plain bash scripts/launch_stage2_arm.sh 2>&1 | tee runs/q25_stage2_plain_hint.log
+ARM=q25_hint_dual  bash scripts/launch_stage2_arm.sh 2>&1 | tee runs/q25_stage2_dual_hint.log
 ```
 
 Qwen3 两臂（P1；nothink 由脚本内置。8 卡机上也可给 Q3 臂加
