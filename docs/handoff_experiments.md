@@ -21,8 +21,10 @@ policy prompt 与全历史窗口（history_length=50）。
 （`PROMPT_FORMAT=verl` 为脚本默认），不加任何额外指令——原设计的 stage2
 "先回顾历史"句已删除（`STAGE2_PROMPT=false` 为默认，Q3 起点 A/B 实测该句
 对 val 影响≈0）。与官方配方的唯一差异是 `history_length=50`（futile 机制
-需要全历史）。起点基线（128 局 valid_seen，T=0.4，50 步，Q2.5）：冷启动
-0.148 / base 0.227（带句版 v2 实测；无句版 v3 出分后在此更新）。诊断用的
+需要全历史）。起点基线（正式口径：无句版，128 局 valid_seen，T=0.4，50 步，Q2.5）：
+**冷启动 0.156 / base 0.125**（SR@20：0.086 / 0.031；带句版对照 0.148 / 0.227
+——该句对冷启动无影响，但给 base 的 50 步游荡式晚胜 +0.10，删句后臂间
+起点为冷启动领先，因果链方向正确）。诊断用的
 e2l 格式（Stage-1 同款，system+user 双消息）保留在 `PROMPT_FORMAT=e2l`，
 实测其 128 局 val 最长 prompt ≈2.9k tokens；verl 模板下 Q2.5 @4096、Q3
 @5120 亦无截断。
